@@ -1,0 +1,4838 @@
+diff --git a/src/mpl2/CMakeLists.txt b/src/mpl2/CMakeLists.txt
+index ceb323f00..19e132704 100644
+--- a/src/mpl2/CMakeLists.txt
++++ b/src/mpl2/CMakeLists.txt
+@@ -33,13 +33,15 @@
+ 
+ include("openroad")
+ 
++# set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
+-
+-find_package(ortools REQUIRED)
++find_package(ortools REQUIRED COMPONENTS sat)
+ 
+ add_library(mpl2_lib
+   src/rtl_mp.cpp
+   src/hier_rtlmp.cpp
++  src/MacroPlacementSolver.cpp
++  src/IncreMacroPlacement.cpp
+   src/object.cpp
+   src/SimulatedAnnealingCore.cpp
+   src/SACoreHardMacro.cpp
+diff --git a/src/mpl2/include/mpl2/rtl_mp.h b/src/mpl2/include/mpl2/rtl_mp.h
+index c8b4fe14a..3bdec0e41 100644
+--- a/src/mpl2/include/mpl2/rtl_mp.h
++++ b/src/mpl2/include/mpl2/rtl_mp.h
+@@ -113,6 +113,7 @@ class MacroPlacer2
+   std::vector<odb::dbInst*> findOverlappedMacros(odb::dbInst* macro);
+ 
+   void setMacroPlacementFile(const std::string& file_name);
++  bool runIncrementalMacroPlacement();
+   void addGuidanceRegion(odb::dbInst* macro, const Rect& region);
+ 
+   void setDebug(std::unique_ptr<Mpl2Observer>& graphics);
+diff --git a/src/mpl2/src/IncreMacroPlacement.cpp b/src/mpl2/src/IncreMacroPlacement.cpp
+new file mode 100644
+index 000000000..200331313
+--- /dev/null
++++ b/src/mpl2/src/IncreMacroPlacement.cpp
+@@ -0,0 +1,963 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "hier_rtlmp.h"
++
++#include <algorithm>
++#include <array>
++#include <deque>
++#include <cmath>
++#include <limits>
++#include <map>
++#include <optional>
++#include <set>
++#include <string>
++#include <unordered_set>
++#include <vector>
++
++#include "db_sta/dbNetwork.hh"
++#include "db_sta/dbSta.hh"
++#include "object.h"
++#include "odb/db.h"
++#include "sta/Graph.hh"
++#include "sta/Liberty.hh"
++#include "sta/MinMax.hh"
++#include "utl/Logger.h"
++
++namespace mpl2 {
++
++using utl::MPL;
++
++namespace {
++
++// Tunable knobs for the first ASP-DAC incremental refinement implementation.
++// They are intentionally conservative because the flow starts from a legalized
++// standard-cell placement; moving a macro too far can improve one local path but
++// damage many already-placed cells around it.
++constexpr double kArraySwapMinCostReductionRatio = 0.05;
++constexpr double kFreeMoveMinCostReductionRatio = 0.10;
++constexpr double kFreeMoveMaxDisplacementMicrons = 5.0;
++constexpr int kFreeMoveMaxIterations = 18;
++constexpr double kFreeMoveDisplacementPenalty = 2.0;
++constexpr double kFreeMoveInitialStep = 0.10;
++constexpr double kFreeMoveStepDecay = 0.10;
++constexpr double kOrientMinHpwlReductionRatio = 0.05;
++
++bool isHardMacro(odb::dbInst* inst)
++{
++  return inst != nullptr && inst->getMaster() != nullptr && inst->getMaster()->isBlock();
++}
++
++bool isFixedMacro(odb::dbInst* inst)
++{
++  const odb::dbPlacementStatus status = inst->getPlacementStatus();
++  return status == odb::dbPlacementStatus::LOCKED
++         || status == odb::dbPlacementStatus::FIRM;
++}
++
++bool isSignalNet(odb::dbNet* net)
++{
++  return net != nullptr && net->getSigType() == odb::dbSigType::SIGNAL;
++}
++
++bool isSequential(odb::dbInst* inst, sta::dbNetwork* network)
++{
++  if (inst == nullptr || network == nullptr) {
++    return false;
++  }
++  const sta::LibertyCell* liberty_cell = network->libertyCell(inst);
++  return liberty_cell != nullptr && liberty_cell->hasSequentials();
++}
++
++bool isSinkLike(odb::dbITerm* iterm)
++{
++  return iterm->getIoType() == odb::dbIoType::INPUT
++         || iterm->getIoType() == odb::dbIoType::INOUT;
++}
++
++bool isDriverLike(odb::dbITerm* iterm)
++{
++  return iterm->getIoType() == odb::dbIoType::OUTPUT
++         || iterm->getIoType() == odb::dbIoType::INOUT;
++}
++
++std::optional<float> pinSlack(odb::dbITerm* iterm,
++                              sta::dbSta* sta,
++                              sta::dbNetwork* network)
++{
++  if (iterm == nullptr || sta == nullptr || network == nullptr) {
++    return std::nullopt;
++  }
++
++  // The caller is responsible for sourcing Liberty/SDC and estimating
++  // parasitics after standard-cell placement.  Here we only query the current
++  // OpenSTA graph, so the slack is exactly for the placement loaded in OpenDB.
++  sta::Pin* pin = network->dbToSta(iterm);
++  if (pin == nullptr || sta->graph() == nullptr) {
++    return std::nullopt;
++  }
++
++  sta::Vertex* vertex = sta->graph()->pinLoadVertex(pin);
++  if (vertex == nullptr) {
++    vertex = sta->graph()->pinDrvrVertex(pin);
++  }
++  if (vertex == nullptr) {
++    return std::nullopt;
++  }
++  return sta->vertexSlack(vertex, sta::MinMax::max());
++}
++
++std::optional<float> worstInstanceSlack(odb::dbInst* inst,
++                                        sta::dbSta* sta,
++                                        sta::dbNetwork* network)
++{
++  std::optional<float> worst;
++  if (inst == nullptr) {
++    return worst;
++  }
++  for (odb::dbITerm* iterm : inst->getITerms()) {
++    const std::optional<float> slack = pinSlack(iterm, sta, network);
++    if (!slack.has_value()) {
++      continue;
++    }
++    if (!worst.has_value() || slack.value() < worst.value()) {
++      worst = slack.value();
++    }
++  }
++  return worst;
++}
++
++constexpr int kMaxEndpointTraceDepth = 30;
++constexpr int kMaxEndpointTracePins = 20000;
++
++void collectDownstreamRegisters(odb::dbInst* root_macro,
++                                odb::dbITerm* driver_pin,
++                                sta::dbNetwork* network,
++                                std::set<odb::dbInst*>& found_regs,
++                                std::set<odb::dbITerm*>& visited,
++                                int)
++{
++  if (driver_pin == nullptr) {
++    return;
++  }
++
++  // Use level-by-level BFS so each macro pin is associated with the nearest
++  // sequential endpoints only.  This mirrors the paper's wording and avoids a
++  // deep fanout cone overwhelming the refinement objective with distant regs.
++  std::deque<std::pair<odb::dbITerm*, int>> queue;
++  queue.push_back({driver_pin, 0});
++  while (!queue.empty() && found_regs.empty() && visited.size() <= kMaxEndpointTracePins) {
++    const auto [pin, depth] = queue.front();
++    queue.pop_front();
++    if (pin == nullptr || depth > kMaxEndpointTraceDepth || !visited.insert(pin).second) {
++      continue;
++    }
++    odb::dbNet* net = pin->getNet();
++    if (!isSignalNet(net)) {
++      continue;
++    }
++    for (odb::dbITerm* sink_pin : net->getITerms()) {
++      odb::dbInst* sink_inst = sink_pin->getInst();
++      if (sink_inst == nullptr || sink_inst == root_macro || !isSinkLike(sink_pin)) {
++        continue;
++      }
++      if (isSequential(sink_inst, network)) {
++        found_regs.insert(sink_inst);
++        continue;
++      }
++      if (isHardMacro(sink_inst)) {
++        continue;
++      }
++      for (odb::dbITerm* next_pin : sink_inst->getITerms()) {
++        if (isDriverLike(next_pin)) {
++          queue.push_back({next_pin, depth + 1});
++        }
++      }
++    }
++  }
++}
++
++void collectUpstreamRegisters(odb::dbInst* root_macro,
++                              odb::dbITerm* sink_pin,
++                              sta::dbNetwork* network,
++                              std::set<odb::dbInst*>& found_regs,
++                              std::set<odb::dbITerm*>& visited,
++                              int)
++{
++  if (sink_pin == nullptr) {
++    return;
++  }
++
++  std::deque<std::pair<odb::dbITerm*, int>> queue;
++  queue.push_back({sink_pin, 0});
++  while (!queue.empty() && found_regs.empty() && visited.size() <= kMaxEndpointTracePins) {
++    const auto [pin, depth] = queue.front();
++    queue.pop_front();
++    if (pin == nullptr || depth > kMaxEndpointTraceDepth || !visited.insert(pin).second) {
++      continue;
++    }
++    odb::dbNet* net = pin->getNet();
++    if (!isSignalNet(net)) {
++      continue;
++    }
++    for (odb::dbITerm* driver_pin : net->getITerms()) {
++      odb::dbInst* driver_inst = driver_pin->getInst();
++      if (driver_inst == nullptr || driver_inst == root_macro || !isDriverLike(driver_pin)) {
++        continue;
++      }
++      if (isSequential(driver_inst, network)) {
++        found_regs.insert(driver_inst);
++        continue;
++      }
++      if (isHardMacro(driver_inst)) {
++        continue;
++      }
++      for (odb::dbITerm* prev_pin : driver_inst->getITerms()) {
++        if (isSinkLike(prev_pin)) {
++          queue.push_back({prev_pin, depth + 1});
++        }
++      }
++    }
++  }
++}
++
++std::vector<odb::dbInst*> collectMacros(odb::dbBlock* block)
++{
++  std::vector<odb::dbInst*> macros;
++  if (block == nullptr) {
++    return macros;
++  }
++  for (odb::dbInst* inst : block->getInsts()) {
++    if (isHardMacro(inst)) {
++      macros.push_back(inst);
++    }
++  }
++  std::sort(macros.begin(), macros.end(), [](odb::dbInst* lhs, odb::dbInst* rhs) {
++    return lhs->getName() < rhs->getName();
++  });
++  return macros;
++}
++
++
++int centerX(odb::dbInst* inst)
++{
++  return inst->getBBox()->getBox().xCenter();
++}
++
++int centerY(odb::dbInst* inst)
++{
++  return inst->getBBox()->getBox().yCenter();
++}
++
++bool nameLess(odb::dbInst* lhs, odb::dbInst* rhs)
++{
++  return lhs->getName() < rhs->getName();
++}
++
++bool hasArrayLikeAlignment(const std::vector<odb::dbInst*>& macros,
++                           odb::dbBlock* block)
++{
++  if (macros.size() < 2 || block == nullptr) {
++    return false;
++  }
++
++  // This is the lightweight ASP-DAC D-stage classifier. The thesis version can
++  // later replace it with DBSCAN/outlier handling, but for now we only need a
++  // stable way to separate memory-array macros from freely movable macros after
++  // standard-cell placement. Same-master macros whose centers share a row or a
++  // column are treated as array constrained.
++  const int align_tolerance_dbu = block->micronsToDbu(2.0);
++  for (size_t i = 0; i < macros.size(); i++) {
++    for (size_t j = i + 1; j < macros.size(); j++) {
++      const bool same_column = std::abs(centerX(macros[i]) - centerX(macros[j]))
++                               <= align_tolerance_dbu;
++      const bool same_row = std::abs(centerY(macros[i]) - centerY(macros[j]))
++                            <= align_tolerance_dbu;
++      if (same_column || same_row) {
++        return true;
++      }
++    }
++  }
++  return false;
++}
++
++
++double macroCriticalityWeight(odb::dbInst* reg,
++                              const std::map<odb::dbInst*, float>& reg_slack)
++{
++  const auto slack_it = reg_slack.find(reg);
++  if (slack_it == reg_slack.end()) {
++    return 1.0;
++  }
++  // Negative slack is already in nanoseconds.  Add a small floor so all traced
++  // endpoints keep influence, while worse endpoints pull harder.
++  return std::max(0.001, static_cast<double>(-slack_it->second));
++}
++
++double macroCostAtCenter(
++    odb::dbInst* macro,
++    double center_x,
++    double center_y,
++    const std::map<odb::dbInst*, std::set<odb::dbInst*>>& macro_to_regs,
++    const std::map<odb::dbInst*, float>& reg_slack)
++{
++  const auto regs_it = macro_to_regs.find(macro);
++  if (regs_it == macro_to_regs.end() || regs_it->second.empty()) {
++    return 0.0;
++  }
++
++  double cost = 0.0;
++  for (odb::dbInst* reg : regs_it->second) {
++    const odb::Rect& reg_box = reg->getBBox()->getBox();
++    const double dx = center_x - reg_box.xCenter();
++    const double dy = center_y - reg_box.yCenter();
++    cost += macroCriticalityWeight(reg, reg_slack) * (dx * dx + dy * dy);
++  }
++  return cost;
++}
++
++double macroCostAtOrigin(
++    odb::dbInst* macro,
++    int origin_x,
++    int origin_y,
++    const std::map<odb::dbInst*, std::set<odb::dbInst*>>& macro_to_regs,
++    const std::map<odb::dbInst*, float>& reg_slack)
++{
++  const odb::Rect& box = macro->getBBox()->getBox();
++  const double center_x = origin_x + box.dx() / 2.0;
++  const double center_y = origin_y + box.dy() / 2.0;
++  return macroCostAtCenter(macro, center_x, center_y, macro_to_regs, reg_slack);
++}
++
++float macroWorstSlack(odb::dbInst* macro,
++                      const std::unordered_map<odb::dbInst*, std::vector<float>>& macro_slack)
++{
++  const auto slack_it = macro_slack.find(macro);
++  if (slack_it == macro_slack.end() || slack_it->second.empty()) {
++    return 0.0f;
++  }
++  return *std::min_element(slack_it->second.begin(), slack_it->second.end());
++}
++
++odb::Rect rectAtOrigin(odb::dbInst* macro, int origin_x, int origin_y)
++{
++  const odb::Rect& box = macro->getBBox()->getBox();
++  return odb::Rect(origin_x, origin_y, origin_x + box.dx(), origin_y + box.dy());
++}
++
++bool hasMacroOverlapAt(odb::dbInst* macro,
++                       const odb::Rect& candidate_box,
++                       odb::dbBlock* block)
++{
++  for (odb::dbInst* inst : block->getInsts()) {
++    if (inst == macro || !isHardMacro(inst) || !inst->isPlaced()) {
++      continue;
++    }
++    if (candidate_box.overlaps(inst->getBBox()->getBox())) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool isLegalMacroBox(odb::dbInst* macro,
++                     const odb::Rect& candidate_box,
++                     odb::dbBlock* block)
++{
++  return block != nullptr && block->getCoreArea().contains(candidate_box)
++         && !hasMacroOverlapAt(macro, candidate_box, block);
++}
++
++int clampOriginX(odb::dbInst* macro, int x, const odb::Rect& core)
++{
++  return std::clamp(x, core.xMin(), core.xMax() - static_cast<int>(macro->getBBox()->getDX()));
++}
++
++int clampOriginY(odb::dbInst* macro, int y, const odb::Rect& core)
++{
++  return std::clamp(y, core.yMin(), core.yMax() - static_cast<int>(macro->getBBox()->getDY()));
++}
++
++std::pair<double, double> weightedRegisterCenter(
++    odb::dbInst* macro,
++    const std::map<odb::dbInst*, std::set<odb::dbInst*>>& macro_to_regs,
++    const std::map<odb::dbInst*, float>& reg_slack)
++{
++  const auto regs_it = macro_to_regs.find(macro);
++  if (regs_it == macro_to_regs.end() || regs_it->second.empty()) {
++    const odb::Rect& box = macro->getBBox()->getBox();
++    return {static_cast<double>(box.xCenter()), static_cast<double>(box.yCenter())};
++  }
++
++  double sum_weight = 0.0;
++  double target_x = 0.0;
++  double target_y = 0.0;
++  for (odb::dbInst* reg : regs_it->second) {
++    const double weight = macroCriticalityWeight(reg, reg_slack);
++    const odb::Rect& reg_box = reg->getBBox()->getBox();
++    target_x += weight * reg_box.xCenter();
++    target_y += weight * reg_box.yCenter();
++    sum_weight += weight;
++  }
++  return {target_x / sum_weight, target_y / sum_weight};
++}
++
++bool hasMeaningfulCostReduction(double before, double after, double min_ratio)
++{
++  if (before <= 0.0) {
++    return after < before;
++  }
++  return after <= before * (1.0 - min_ratio);
++}
++
++int clampNearInitial(int value, int initial, int max_delta)
++{
++  return std::clamp(value, initial - max_delta, initial + max_delta);
++}
++
++}  // namespace
++
++bool HierRTLMP::runIncrementalMacroPlacement()
++{
++  return IncrementalMacroPlacement();
++}
++
++bool HierRTLMP::IncrementalMacroPlacement()
++{
++  logger_->info(MPL, 1026, "Starting incremental macro placement refinement.");
++  IncreInitialize();
++  CriticalMacroFilter();
++  MacroClassify();
++
++  logger_->info(MPL,
++                1027,
++                "Incremental macro placement diagnostics: {} critical macros, {} array groups, {} free macros.",
++                critical_macro_to_regs_.size(),
++                array_critical_macro_insts_.size(),
++                free_critical_macro_insts_.size());
++
++  if (critical_macro_to_regs_.empty()) {
++    logger_->info(MPL, 1028, "No critical macros were selected; placement is unchanged.");
++    return false;
++  }
++
++  const int accepted_swaps = TilingMacroExchange();
++  const int moved_macros = FreeMacroOptimize();
++  const int changed_orients = MacroOrientOptimizer();
++  const bool changed = accepted_swaps > 0 || moved_macros > 0 || changed_orients > 0;
++  logger_->info(MPL,
++                1040,
++                "Incremental macro placement changed macros: {} ({} swaps, {} moves, {} orientation changes).",
++                changed ? "yes" : "no",
++                accepted_swaps,
++                moved_macros,
++                changed_orients);
++  return changed;
++}
++
++void HierRTLMP::IncreInitialize()
++{
++  critical_macro_to_regs_.clear();
++  critical_regs_slack_.clear();
++  macro_delay_fit.clear();
++  tile_critical_macros_.clear();
++  free_critical_macros_.clear();
++  array_critical_macro_insts_.clear();
++  free_critical_macro_insts_.clear();
++  critical_macro_slack_.clear();
++  macro_pin_regs_.clear();
++  placed_macros_.clear();
++
++  block_ = db_->getChip()->getBlock();
++  const std::vector<odb::dbInst*> macros = collectMacros(block_);
++  int fixed_count = 0;
++  for (odb::dbInst* macro : macros) {
++    const bool fixed = isFixedMacro(macro);
++    placed_macros_[macro] = fixed;
++    if (fixed) {
++      fixed_count++;
++    }
++  }
++
++  logger_->info(MPL,
++                1029,
++                "Initialized incremental macro placement on block {} with {} macros ({} fixed).",
++                block_->getName(),
++                macros.size(),
++                fixed_count);
++}
++
++void HierRTLMP::CriticalMacroFilter()
++{
++  initializeSTA();
++  const std::vector<odb::dbInst*> macros = collectMacros(block_);
++  int macro_pin_count = 0;
++  int connected_macro_pin_count = 0;
++  int negative_macro_pin_count = 0;
++  int candidate_endpoint_count = 0;
++  int negative_endpoint_count = 0;
++  int missing_slack_count = 0;
++
++  for (odb::dbInst* macro : macros) {
++    for (odb::dbITerm* macro_pin : macro->getITerms()) {
++      macro_pin_count++;
++      odb::dbNet* net = macro_pin->getNet();
++      if (!isSignalNet(net)) {
++        continue;
++      }
++      connected_macro_pin_count++;
++
++      const std::optional<float> macro_pin_slack = pinSlack(macro_pin, sta_, network_);
++      if (!macro_pin_slack.has_value()) {
++        missing_slack_count++;
++        continue;
++      }
++      if (macro_pin_slack.value() >= 0.0f) {
++        continue;
++      }
++      negative_macro_pin_count++;
++      critical_macro_slack_[macro].push_back(macro_pin_slack.value());
++
++      std::set<odb::dbInst*> endpoints;
++      std::set<odb::dbITerm*> visited_trace_pins;
++      if (isDriverLike(macro_pin)) {
++        findDownstreamRegisters(macro, macro_pin, endpoints, visited_trace_pins);
++      }
++      if (isSinkLike(macro_pin)) {
++        findUpstreamRegisters(macro, macro_pin, endpoints, visited_trace_pins);
++      }
++
++      for (odb::dbInst* endpoint : endpoints) {
++        candidate_endpoint_count++;
++        const std::optional<float> endpoint_slack = worstInstanceSlack(endpoint, sta_, network_);
++        if (!endpoint_slack.has_value()) {
++          missing_slack_count++;
++          continue;
++        }
++        if (endpoint_slack.value() < 0.0f) {
++          negative_endpoint_count++;
++          critical_macro_to_regs_[macro].insert(endpoint);
++          macro_pin_regs_[macro][macro_pin].insert(endpoint);
++
++          const auto slack_it = critical_regs_slack_.find(endpoint);
++          if (slack_it == critical_regs_slack_.end()
++              || endpoint_slack.value() < slack_it->second) {
++            critical_regs_slack_[endpoint] = endpoint_slack.value();
++          }
++        }
++      }
++    }
++  }
++
++  // Keep the first implementation intentionally transparent: the counters tell
++  // whether a run is using real post-placement STA data or merely seeing an
++  // un-timed database.  If missing_slack_count is high, the Tcl flow probably
++  // forgot to read Liberty/SDC and call estimate_parasitics after placement.
++  logger_->info(MPL,
++                1030,
++                "Critical macro filter scanned {} macro pins ({} connected signal pins, {} negative macro pins, {} sequential endpoint candidates, {} negative endpoints, {} missing slack queries).",
++                macro_pin_count,
++                connected_macro_pin_count,
++                negative_macro_pin_count,
++                candidate_endpoint_count,
++                negative_endpoint_count,
++                missing_slack_count);
++}
++
++void HierRTLMP::MacroClassify()
++{
++  array_critical_macro_insts_.clear();
++  free_critical_macro_insts_.clear();
++
++  std::vector<odb::dbInst*> critical_macros;
++  critical_macros.reserve(critical_macro_to_regs_.size());
++  for (const auto& [macro, regs] : critical_macro_to_regs_) {
++    if (macro != nullptr && !regs.empty()) {
++      critical_macros.push_back(macro);
++    }
++  }
++  std::sort(critical_macros.begin(), critical_macros.end(), nameLess);
++
++  std::map<odb::dbMaster*, std::vector<odb::dbInst*>> macros_by_master;
++  for (odb::dbInst* macro : critical_macros) {
++    macros_by_master[macro->getMaster()].push_back(macro);
++  }
++
++  std::unordered_set<odb::dbInst*> array_macros;
++  for (auto& [master, macros] : macros_by_master) {
++    std::sort(macros.begin(), macros.end(), nameLess);
++    if (master != nullptr && hasArrayLikeAlignment(macros, block_)) {
++      array_critical_macro_insts_.push_back(macros);
++      array_macros.insert(macros.begin(), macros.end());
++    }
++  }
++
++  for (odb::dbInst* macro : critical_macros) {
++    if (array_macros.find(macro) == array_macros.end()) {
++      free_critical_macro_insts_.push_back(macro);
++    }
++  }
++
++  // The following movement stages consume the dbInst-level groups. The old
++  // HardMacro containers are left untouched for compatibility with the original
++  // global RTLMP code above the Origin marker.
++  logger_->info(MPL,
++                1031,
++                "Classified {} critical macros into {} array groups and {} free macros.",
++                critical_macros.size(),
++                array_critical_macro_insts_.size(),
++                free_critical_macro_insts_.size());
++}
++
++int HierRTLMP::TilingMacroExchange()
++{
++  int accepted_swaps = 0;
++  for (const std::vector<odb::dbInst*>& group : array_critical_macro_insts_) {
++    if (group.size() < 2) {
++      continue;
++    }
++
++    std::vector<odb::dbInst*> candidates = group;
++    std::sort(candidates.begin(), candidates.end(), [&](odb::dbInst* lhs, odb::dbInst* rhs) {
++      return macroWorstSlack(lhs, critical_macro_slack_)
++             < macroWorstSlack(rhs, critical_macro_slack_);
++    });
++
++    // The paper limits array disturbance to at most half of the array.  Use the
++    // worst-slack half as the active set, then accept only swaps that reduce the
++    // timing-weighted distance objective for the two swapped macros.
++    const size_t active_count = std::max<size_t>(1, group.size() / 2);
++    candidates.resize(std::min(active_count, candidates.size()));
++
++    std::set<odb::dbInst*> already_swapped;
++    for (odb::dbInst* active_macro : candidates) {
++      if (already_swapped.count(active_macro) != 0 || isFixedMacro(active_macro)) {
++        continue;
++      }
++
++      odb::dbInst* best_partner = nullptr;
++      double best_delta = 0.0;
++      const odb::Point active_origin = active_macro->getOrigin();
++      const double active_cost
++          = macroCostAtOrigin(active_macro,
++                              active_origin.x(),
++                              active_origin.y(),
++                              critical_macro_to_regs_,
++                              critical_regs_slack_);
++
++      for (odb::dbInst* partner : group) {
++        if (partner == active_macro || isFixedMacro(partner)
++            || already_swapped.count(partner) != 0) {
++          continue;
++        }
++        const odb::Point partner_origin = partner->getOrigin();
++        const double partner_cost
++            = macroCostAtOrigin(partner,
++                                partner_origin.x(),
++                                partner_origin.y(),
++                                critical_macro_to_regs_,
++                                critical_regs_slack_);
++        const double swapped_cost
++            = macroCostAtOrigin(active_macro,
++                                partner_origin.x(),
++                                partner_origin.y(),
++                                critical_macro_to_regs_,
++                                critical_regs_slack_)
++              + macroCostAtOrigin(partner,
++                                  active_origin.x(),
++                                  active_origin.y(),
++                                  critical_macro_to_regs_,
++                                  critical_regs_slack_);
++        const double original_cost = active_cost + partner_cost;
++        const double delta = swapped_cost - original_cost;
++        if (hasMeaningfulCostReduction(original_cost, swapped_cost, kArraySwapMinCostReductionRatio)
++            && delta < best_delta) {
++          best_delta = delta;
++          best_partner = partner;
++        }
++      }
++
++      if (best_partner != nullptr) {
++        const odb::Point active_origin = active_macro->getOrigin();
++        const odb::Point partner_origin = best_partner->getOrigin();
++        active_macro->setLocation(partner_origin.x(), partner_origin.y());
++        best_partner->setLocation(active_origin.x(), active_origin.y());
++        logger_->info(MPL,
++                      1037,
++                      "Array swap accepted: {} <-> {} (local cost delta {:.3e}).",
++                      active_macro->getName(),
++                      best_partner->getName(),
++                      best_delta);
++        already_swapped.insert(active_macro);
++        already_swapped.insert(best_partner);
++        accepted_swaps++;
++      }
++    }
++  }
++
++  logger_->info(MPL,
++                1032,
++                "Accepted {} array macro swaps across {} array groups.",
++                accepted_swaps,
++                array_critical_macro_insts_.size());
++  return accepted_swaps;
++}
++
++int HierRTLMP::FreeMacroOptimize()
++{
++  int moved_macros = 0;
++  const odb::Rect core = block_->getCoreArea();
++
++  for (odb::dbInst* macro : free_critical_macro_insts_) {
++    if (macro == nullptr || isFixedMacro(macro)) {
++      continue;
++    }
++
++    const odb::Point initial_origin = macro->getOrigin();
++    const odb::Rect initial_box = macro->getBBox()->getBox();
++    const auto [target_x, target_y]
++        = weightedRegisterCenter(macro, critical_macro_to_regs_, critical_regs_slack_);
++
++    double current_center_x = initial_box.xCenter();
++    double current_center_y = initial_box.yCenter();
++    const double initial_cost = macroCostAtCenter(macro,
++                                            current_center_x,
++                                            current_center_y,
++                                            critical_macro_to_regs_,
++                                            critical_regs_slack_);
++    double best_cost = initial_cost;
++    int best_x = initial_origin.x();
++    int best_y = initial_origin.y();
++    const int max_move_dbu = block_->micronsToDbu(kFreeMoveMaxDisplacementMicrons);
++
++    // Projected-gradient-style refinement: take damped steps toward the weighted
++    // critical-register center, project into the core, and reject candidates that
++    // overlap existing placed macros.  The displacement penalty is deliberately
++    // strong in this first packaged version: post-placement macro moves disturb
++    // standard-cell placement, so a move must be both small and clearly useful.
++    for (int iter = 0; iter < kFreeMoveMaxIterations; iter++) {
++      const double regularized_target_x
++          = (target_x + kFreeMoveDisplacementPenalty * initial_box.xCenter())
++            / (1.0 + kFreeMoveDisplacementPenalty);
++      const double regularized_target_y
++          = (target_y + kFreeMoveDisplacementPenalty * initial_box.yCenter())
++            / (1.0 + kFreeMoveDisplacementPenalty);
++      const double step = kFreeMoveInitialStep / (1.0 + kFreeMoveStepDecay * iter);
++      current_center_x += step * (regularized_target_x - current_center_x);
++      current_center_y += step * (regularized_target_y - current_center_y);
++
++      int candidate_x = static_cast<int>(std::lround(current_center_x - initial_box.dx() / 2.0));
++      int candidate_y = static_cast<int>(std::lround(current_center_y - initial_box.dy() / 2.0));
++      candidate_x = clampNearInitial(candidate_x, initial_origin.x(), max_move_dbu);
++      candidate_y = clampNearInitial(candidate_y, initial_origin.y(), max_move_dbu);
++      candidate_x = clampOriginX(macro, candidate_x, core);
++      candidate_y = clampOriginY(macro, candidate_y, core);
++
++      const odb::Rect candidate_box = rectAtOrigin(macro, candidate_x, candidate_y);
++      if (!isLegalMacroBox(macro, candidate_box, block_)) {
++        continue;
++      }
++
++      const double candidate_cost
++          = macroCostAtOrigin(macro,
++                              candidate_x,
++                              candidate_y,
++                              critical_macro_to_regs_,
++                              critical_regs_slack_);
++      if (hasMeaningfulCostReduction(initial_cost, candidate_cost, kFreeMoveMinCostReductionRatio)
++          && candidate_cost < best_cost) {
++        best_cost = candidate_cost;
++        best_x = candidate_x;
++        best_y = candidate_y;
++      }
++    }
++
++    if (best_x != initial_origin.x() || best_y != initial_origin.y()) {
++      logger_->info(MPL,
++                    1038,
++                    "Free macro move accepted: {} ({:.3f}, {:.3f}) -> ({:.3f}, {:.3f}), local cost {:.3e} -> {:.3e}.",
++                    macro->getName(),
++                    block_->dbuToMicrons(initial_origin.x()),
++                    block_->dbuToMicrons(initial_origin.y()),
++                    block_->dbuToMicrons(best_x),
++                    block_->dbuToMicrons(best_y),
++                    initial_cost,
++                    best_cost);
++      macro->setLocation(best_x, best_y);
++      moved_macros++;
++    }
++  }
++
++  logger_->info(MPL,
++                1033,
++                "Moved {} free critical macros with projected-gradient refinement.",
++                moved_macros);
++  return moved_macros;
++}
++
++int HierRTLMP::MacroOrientOptimizer()
++{
++  int changed_orients = 0;
++  const std::array<odb::dbOrientType, 4> candidate_orients = {
++      odb::dbOrientType::R0,
++      odb::dbOrientType::MX,
++      odb::dbOrientType::MY,
++      odb::dbOrientType::R180,
++  };
++
++  std::vector<odb::dbInst*> macros;
++  for (const auto& group : array_critical_macro_insts_) {
++    macros.insert(macros.end(), group.begin(), group.end());
++  }
++  macros.insert(macros.end(),
++                free_critical_macro_insts_.begin(),
++                free_critical_macro_insts_.end());
++  std::sort(macros.begin(), macros.end(), nameLess);
++  macros.erase(std::unique(macros.begin(), macros.end()), macros.end());
++
++  for (odb::dbInst* macro : macros) {
++    if (macro == nullptr || isFixedMacro(macro)) {
++      continue;
++    }
++
++    const odb::dbOrientType original_orient = macro->getOrient();
++    const odb::Point origin = macro->getOrigin();
++    int64_t best_hpwl = ComputeMacroNetHpwl(macro);
++    odb::dbOrientType best_orient = original_orient;
++
++    for (const odb::dbOrientType& orient : candidate_orients) {
++      macro->setOrient(orient);
++      macro->setLocation(origin.x(), origin.y());
++      if (!isLegalMacroBox(macro, macro->getBBox()->getBox(), block_)) {
++        continue;
++      }
++      const int64_t hpwl = ComputeMacroNetHpwl(macro);
++      if (hpwl <= static_cast<int64_t>((1.0 - kOrientMinHpwlReductionRatio) * best_hpwl)) {
++        best_hpwl = hpwl;
++        best_orient = orient;
++      }
++    }
++
++    macro->setOrient(best_orient);
++    macro->setLocation(origin.x(), origin.y());
++    if (best_orient != original_orient) {
++      logger_->info(MPL,
++                    1039,
++                    "Macro orientation accepted: {} {} -> {} (local HPWL {}).",
++                    macro->getName(),
++                    original_orient.getString(),
++                    best_orient.getString(),
++                    best_hpwl);
++      changed_orients++;
++    }
++  }
++
++  logger_->info(MPL,
++                1036,
++                "Changed {} macro orientations by local HPWL enumeration.",
++                changed_orients);
++  return changed_orients;
++}
++
++void HierRTLMP::initializeSTA()
++{
++  if (sta_ == nullptr) {
++    logger_->warn(MPL, 1034, "OpenSTA handle is not available for incremental macro placement.");
++    return;
++  }
++
++  // Recompute timing for the database as loaded by the Tcl flow.  This should
++  // be called only after standard-cell placement and parasitic estimation so the
++  // critical macro diagnosis reflects the placed design, not floorplan guesses.
++  sta_->ensureGraph();
++  sta_->updateTiming(false);
++}
++
++void HierRTLMP::analyzeMacroPins(const std::string& file_path,
++                                 const std::string& output_file_path)
++{
++  logger_->info(MPL,
++                1035,
++                "Macro pin timing analysis is not implemented yet (input: {}, output: {}).",
++                file_path,
++                output_file_path);
++}
++
++void HierRTLMP::findDownstreamRegisters(odb::dbInst* macro,
++                                        odb::dbITerm* iterm,
++                                        std::set<odb::dbInst*>& found_regs,
++                                        std::set<odb::dbITerm*>& visited)
++{
++  collectDownstreamRegisters(macro, iterm, network_, found_regs, visited, 0);
++}
++
++void HierRTLMP::findUpstreamRegisters(odb::dbInst* macro,
++                                      odb::dbITerm* iterm,
++                                      std::set<odb::dbInst*>& found_regs,
++                                      std::set<odb::dbITerm*>& visited)
++{
++  collectUpstreamRegisters(macro, iterm, network_, found_regs, visited, 0);
++}
++
++void HierRTLMP::delayFitting(odb::dbInst* macro_inst)
++{
++  if (macro_inst != nullptr) {
++    macro_delay_fit[macro_inst] = {0.0f, 0.0f, 0.0f};
++  }
++}
++
++std::pair<float, float> HierRTLMP::freeMacroLP(odb::dbInst* inst, int)
++{
++  if (inst == nullptr) {
++    return {0.0f, 0.0f};
++  }
++  const odb::Point origin = inst->getOrigin();
++  return {static_cast<float>(block_->dbuToMicrons(origin.x())),
++          static_cast<float>(block_->dbuToMicrons(origin.y()))};
++}
++
++void HierRTLMP::findBestOrient(odb::dbInst*,
++                               std::unordered_map<odb::dbITerm*, std::set<odb::dbInst*>>)
++{
++}
++
++void HierRTLMP::findBestOrient(odb::dbInst*)
++{
++}
++
++int64_t HierRTLMP::ComputeMacroNetHpwl(odb::dbInst* macro)
++{
++  if (macro == nullptr) {
++    return 0;
++  }
++
++  int64_t hpwl = 0;
++  for (odb::dbITerm* iterm : macro->getITerms()) {
++    odb::dbNet* net = iterm->getNet();
++    if (!isSignalNet(net)) {
++      continue;
++    }
++    bool has_pin = false;
++    int min_x = std::numeric_limits<int>::max();
++    int min_y = std::numeric_limits<int>::max();
++    int max_x = std::numeric_limits<int>::min();
++    int max_y = std::numeric_limits<int>::min();
++    for (odb::dbITerm* net_iterm : net->getITerms()) {
++      int x = 0;
++      int y = 0;
++      if (!net_iterm->getAvgXY(&x, &y)) {
++        continue;
++      }
++      min_x = std::min(min_x, x);
++      min_y = std::min(min_y, y);
++      max_x = std::max(max_x, x);
++      max_y = std::max(max_y, y);
++      has_pin = true;
++    }
++    if (has_pin) {
++      hpwl += static_cast<int64_t>(max_x - min_x) + static_cast<int64_t>(max_y - min_y);
++    }
++  }
++  return hpwl;
++}
++
++}  // namespace mpl2
+diff --git a/src/mpl2/src/MacroPlacementSolver.cpp b/src/mpl2/src/MacroPlacementSolver.cpp
+new file mode 100644
+index 000000000..b3401f307
+--- /dev/null
++++ b/src/mpl2/src/MacroPlacementSolver.cpp
+@@ -0,0 +1,801 @@
++// SPDX-License-Identifier: BSD-3-Clause
++
++#include "MacroPlacementSolver.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <limits>
++#include <string>
++#include <unordered_map>
++#include <unordered_set>
++
++#include "ortools/sat/cp_model.h"
++#include "ortools/sat/cp_model.pb.h"
++#include "ortools/sat/cp_model_solver.h"
++#include "ortools/sat/model.h"
++#include "ortools/util/sorted_interval_list.h"
++
++namespace mpl2 {
++namespace {
++
++using operations_research::Domain;
++using operations_research::sat::BoolVar;
++using operations_research::sat::CpModelBuilder;
++using operations_research::sat::CpSolverResponse;
++using operations_research::sat::CpSolverStatus;
++using operations_research::sat::IntVar;
++using operations_research::sat::IntervalVar;
++using operations_research::sat::LinearExpr;
++using operations_research::sat::Model;
++using operations_research::sat::NewSatParameters;
++using operations_research::sat::SatParameters;
++using operations_research::sat::SolutionIntegerValue;
++using operations_research::sat::SolveCpModel;
++
++constexpr int64_t kGridSize = 10;
++
++int64_t roundToInt(const double value)
++{
++  return static_cast<int64_t>(std::llround(value));
++}
++
++void setTimeLimit(Model& model, const double max_time_in_seconds)
++{
++  SatParameters parameters;
++  parameters.set_max_time_in_seconds(max_time_in_seconds);
++  model.Add(NewSatParameters(parameters));
++}
++
++bool isFeasible(const CpSolverResponse& response)
++{
++  return response.status() == CpSolverStatus::OPTIMAL
++         || response.status() == CpSolverStatus::FEASIBLE;
++}
++
++LinearExpr sumExprs(const std::vector<LinearExpr>& exprs)
++{
++  LinearExpr sum;
++  for (const LinearExpr& expr : exprs) {
++    sum += expr;
++  }
++  return sum;
++}
++
++std::unordered_map<int, SolverPlacement> toPlacementMap(
++    const std::vector<SolverPlacement>& placements)
++{
++  std::unordered_map<int, SolverPlacement> map;
++  for (const SolverPlacement& placement : placements) {
++    map[placement.id] = placement;
++  }
++  return map;
++}
++
++std::unordered_map<int, SolverPlacement> greedyInitialPlacement(
++    const double layout_width,
++    const double layout_height,
++    std::vector<SolverMacro> macros,
++    const std::vector<SolverWeightedNet>& nets)
++{
++  std::unordered_map<int, double> incident_weight;
++  for (const SolverWeightedNet& net : nets) {
++    incident_weight[net.source] += net.weight;
++    incident_weight[net.target] += net.weight;
++  }
++  std::sort(macros.begin(),
++            macros.end(),
++            [&incident_weight](const SolverMacro& lhs, const SolverMacro& rhs) {
++              const double lhs_weight = incident_weight[lhs.id];
++              const double rhs_weight = incident_weight[rhs.id];
++              if (lhs_weight != rhs_weight) {
++                return lhs_weight > rhs_weight;
++              }
++              const double lhs_area = lhs.width * lhs.height;
++              const double rhs_area = rhs.width * rhs.height;
++              if (lhs_area != rhs_area) {
++                return lhs_area > rhs_area;
++              }
++              return lhs.id < rhs.id;
++            });
++
++  double x_pos = 0.0;
++  double y_pos = layout_height;
++  std::unordered_map<int, SolverPlacement> positions;
++  for (const SolverMacro& macro : macros) {
++    if (x_pos + macro.width > layout_width) {
++      x_pos = 0.0;
++      y_pos -= macro.height;
++    }
++    if (y_pos - macro.height < 0.0) {
++      break;
++    }
++    positions[macro.id] = {macro.id, std::round(x_pos), std::round(y_pos - macro.height)};
++    x_pos += macro.width;
++  }
++  return positions;
++}
++
++
++std::vector<SolverPlacement> completePlacementFallback(
++    const std::vector<SolverMacro>& macros,
++    const std::unordered_map<int, SolverPlacement>& initial)
++{
++  std::vector<SolverPlacement> fallback;
++  fallback.reserve(macros.size());
++  for (const SolverMacro& macro : macros) {
++    const auto it = initial.find(macro.id);
++    if (it != initial.end()) {
++      fallback.push_back(it->second);
++    } else {
++      fallback.push_back({macro.id, 0.0, 0.0});
++    }
++  }
++  return fallback;
++}
++
++int64_t gridSpan(const double value)
++{
++  return std::max<int64_t>(1, static_cast<int64_t>(std::ceil(value / kGridSize)));
++}
++
++bool overlapsWithFixed(const SolverPlacement& location,
++                       const SolverMacro& shape,
++                       const std::unordered_map<int, SolverMacro>& fixed_shapes,
++                       const std::unordered_map<int, SolverPlacement>& fixed_locations,
++                       const int64_t halo)
++{
++  const double lx = location.x - halo;
++  const double ly = location.y - halo;
++  const double ux = location.x + shape.width + halo;
++  const double uy = location.y + shape.height + halo;
++  for (const auto& [id, fixed_loc] : fixed_locations) {
++    const SolverMacro& fixed_shape = fixed_shapes.at(id);
++    const double flx = fixed_loc.x;
++    const double fly = fixed_loc.y;
++    const double fux = fixed_loc.x + fixed_shape.width;
++    const double fuy = fixed_loc.y + fixed_shape.height;
++    if (!(ux <= flx || lx >= fux || uy <= fly || ly >= fuy)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++IntVar newAbsVar(CpModelBuilder& cp_model,
++                 const LinearExpr& expr,
++                 const int64_t upper_bound,
++                 const std::string& name)
++{
++  IntVar value = cp_model.NewIntVar(Domain(0, std::max<int64_t>(0, upper_bound)))
++                     .WithName(name);
++  cp_model.AddAbsEquality(value, expr);
++  return value;
++}
++
++IntVar addOverlapArea(CpModelBuilder& cp_model,
++                      const IntVar& x,
++                      const IntVar& y,
++                      const SolverMacro& macro,
++                      const SolverPlacement& fixed_loc,
++                      const SolverMacro& fixed_shape,
++                      const SolverCore& core,
++                      const int64_t halo,
++                      const int index)
++{
++  const int64_t core_r = roundToInt(core.ux);
++  const int64_t core_t = roundToInt(core.uy);
++  const int64_t width = roundToInt(macro.width);
++  const int64_t height = roundToInt(macro.height);
++  const int64_t fx = roundToInt(fixed_loc.x) - halo;
++  const int64_t fy = roundToInt(fixed_loc.y) - halo;
++  const int64_t fw = roundToInt(fixed_shape.width) + 2 * halo;
++  const int64_t fh = roundToInt(fixed_shape.height) + 2 * halo;
++
++  const IntVar end_x = cp_model.NewIntVar(Domain(0, core_r)).WithName("end_x_" + std::to_string(index));
++  cp_model.AddEquality(end_x, x + width);
++  const IntVar min_end_x = cp_model.NewIntVar(Domain(0, core_r)).WithName("min_end_x_" + std::to_string(index));
++  cp_model.AddMinEquality(min_end_x, {end_x, fx + fw});
++  const IntVar max_start_x = cp_model.NewIntVar(Domain(0, core_r)).WithName("max_start_x_" + std::to_string(index));
++  cp_model.AddMaxEquality(max_start_x, {x, fx});
++  const IntVar raw_w = cp_model.NewIntVar(Domain(-core_r, core_r)).WithName("raw_w_" + std::to_string(index));
++  cp_model.AddEquality(raw_w, min_end_x - max_start_x);
++  const IntVar overlap_w = cp_model.NewIntVar(Domain(0, core_r)).WithName("overlap_w_" + std::to_string(index));
++  cp_model.AddMaxEquality(overlap_w, {raw_w, 0});
++
++  const IntVar end_y = cp_model.NewIntVar(Domain(0, core_t)).WithName("end_y_" + std::to_string(index));
++  cp_model.AddEquality(end_y, y + height);
++  const IntVar min_end_y = cp_model.NewIntVar(Domain(0, core_t)).WithName("min_end_y_" + std::to_string(index));
++  cp_model.AddMinEquality(min_end_y, {end_y, fy + fh});
++  const IntVar max_start_y = cp_model.NewIntVar(Domain(0, core_t)).WithName("max_start_y_" + std::to_string(index));
++  cp_model.AddMaxEquality(max_start_y, {y, fy});
++  const IntVar raw_h = cp_model.NewIntVar(Domain(-core_t, core_t)).WithName("raw_h_" + std::to_string(index));
++  cp_model.AddEquality(raw_h, min_end_y - max_start_y);
++  const IntVar overlap_h = cp_model.NewIntVar(Domain(0, core_t)).WithName("overlap_h_" + std::to_string(index));
++  cp_model.AddMaxEquality(overlap_h, {raw_h, 0});
++
++  const IntVar area = cp_model.NewIntVar(Domain(0, std::max<int64_t>(0, width * height)))
++                          .WithName("overlap_area_" + std::to_string(index));
++  cp_model.AddMultiplicationEquality(area, overlap_w, overlap_h);
++  return area;
++}
++
++SolverPlacement solveBoundaryStage(const SolverCore& core,
++                                   const SolverMacro& macro,
++                                   SolverPlacement location,
++                                   const std::unordered_map<int, SolverMacro>& fixed_shapes,
++                                   const std::unordered_map<int, SolverPlacement>& fixed_locations,
++                                   const int64_t halo)
++{
++  const int64_t left_boundary = roundToInt(core.lx);
++  const int64_t bottom_boundary = roundToInt(core.ly);
++  const int64_t right_boundary = roundToInt(core.ux - macro.width);
++  const int64_t top_boundary = roundToInt(core.uy - macro.height);
++
++  CpModelBuilder first_model;
++  const IntVar x1 = first_model.NewIntVar(Domain(left_boundary, right_boundary));
++  const IntVar y1 = first_model.NewIntVar(Domain(bottom_boundary, top_boundary));
++  const double left = location.x - core.lx;
++  const double right = core.ux - location.x - macro.width;
++  const double bottom = location.y - core.ly;
++  const double top = core.uy - location.y - macro.height;
++  char direction = 'L';
++  double best = left;
++  if (right < best) {
++    best = right;
++    direction = 'R';
++  }
++  if (bottom < best) {
++    best = bottom;
++    direction = 'B';
++  }
++  if (top < best) {
++    direction = 'T';
++  }
++
++  const IntVar dx1 = first_model.NewIntVar(Domain(0, roundToInt(core.ux - core.lx)));
++  const IntVar dy1 = first_model.NewIntVar(Domain(0, roundToInt(core.uy - core.ly)));
++  if (direction == 'L') {
++    first_model.AddEquality(dx1, x1 - roundToInt(core.lx));
++    first_model.AddEquality(dy1, y1 - roundToInt(location.y));
++    first_model.Minimize(100 * dx1 + dy1);
++  } else if (direction == 'R') {
++    first_model.AddEquality(dx1, roundToInt(core.ux) - x1 - roundToInt(macro.width));
++    first_model.AddEquality(dy1, y1 - roundToInt(location.y));
++    first_model.Minimize(100 * dx1 + dy1);
++  } else if (direction == 'B') {
++    first_model.AddEquality(dx1, x1 - roundToInt(location.x));
++    first_model.AddEquality(dy1, y1 - roundToInt(core.ly));
++    first_model.Minimize(dx1 + 100 * dy1);
++  } else {
++    first_model.AddEquality(dx1, x1 - roundToInt(location.x));
++    first_model.AddEquality(dy1, roundToInt(core.uy) - y1 - roundToInt(macro.height));
++    first_model.Minimize(dx1 + 100 * dy1);
++  }
++
++  Model first_sat;
++  const CpSolverResponse first_response = SolveCpModel(first_model.Build(), &first_sat);
++  if (isFeasible(first_response)) {
++    location.x = SolutionIntegerValue(first_response, x1);
++    location.y = SolutionIntegerValue(first_response, y1);
++  }
++
++  int64_t low_x = left_boundary;
++  int64_t high_x = right_boundary;
++  int64_t low_y = bottom_boundary;
++  int64_t high_y = top_boundary;
++  if (direction == 'L') {
++    low_x = roundToInt(location.x);
++    high_x = std::min<int64_t>(roundToInt(location.x + macro.width), right_boundary);
++  } else if (direction == 'R') {
++    low_x = std::max<int64_t>(left_boundary, roundToInt(location.x - 2 * macro.width));
++    high_x = roundToInt(location.x);
++  } else if (direction == 'B') {
++    low_y = roundToInt(location.y);
++    high_y = std::min<int64_t>(roundToInt(location.y + macro.height), top_boundary);
++  } else {
++    low_y = std::max<int64_t>(bottom_boundary, roundToInt(location.y - 2 * macro.height));
++    high_y = roundToInt(location.y);
++  }
++
++  const double core_center_x = (core.lx + core.ux) / 2.0;
++  const double core_center_y = (core.ly + core.uy) / 2.0;
++  const double macro_center_x = location.x + macro.width / 2.0;
++  const double macro_center_y = location.y + macro.height / 2.0;
++  if (fixed_locations.empty()) {
++    if (direction == 'L' || direction == 'R') {
++      location.y = macro_center_y > core_center_y ? top_boundary : bottom_boundary;
++    } else {
++      location.x = macro_center_x > core_center_x ? right_boundary : left_boundary;
++    }
++    return location;
++  }
++
++  CpModelBuilder model;
++  const IntVar x = model.NewIntVar(Domain(low_x, std::max(low_x, high_x)));
++  const IntVar y = model.NewIntVar(Domain(low_y, std::max(low_y, high_y)));
++  std::vector<LinearExpr> overlap_terms;
++  int index = 0;
++  for (const auto& [id, fixed_location] : fixed_locations) {
++    overlap_terms.push_back(
++        addOverlapArea(model, x, y, macro, fixed_location, fixed_shapes.at(id), core, halo, index++));
++  }
++  const int64_t macro_area = roundToInt(macro.width * macro.height);
++  const IntVar total_overlap = model.NewIntVar(Domain(0, std::max<int64_t>(0, macro_area * fixed_locations.size())));
++  model.AddEquality(total_overlap, sumExprs(overlap_terms));
++  const IntVar dx_origin = newAbsVar(model, x - roundToInt(location.x), roundToInt(core.ux), "dx_origin");
++  const IntVar dy_origin = newAbsVar(model, y - roundToInt(location.y), roundToInt(core.uy), "dy_origin");
++  const IntVar origin_distance = model.NewIntVar(Domain(0, roundToInt(core.ux + core.uy)));
++  model.AddEquality(origin_distance, dx_origin + dy_origin);
++
++  if (overlapsWithFixed(location, macro, fixed_shapes, fixed_locations, halo)) {
++    model.Minimize(1000 * total_overlap + origin_distance);
++  } else {
++    const IntVar corner_distance = model.NewIntVar(Domain(0, roundToInt(core.ux + core.uy)));
++    if (direction == 'L' || direction == 'R') {
++      if (macro_center_y >= core_center_y) {
++        model.AddEquality(corner_distance, roundToInt(core.uy) - (y + roundToInt(macro.height)));
++      } else {
++        model.AddEquality(corner_distance, y - roundToInt(core.ly));
++      }
++    } else {
++      if (macro_center_x >= core_center_x) {
++        model.AddEquality(corner_distance, roundToInt(core.ux) - (x + roundToInt(macro.width)));
++      } else {
++        model.AddEquality(corner_distance, x - roundToInt(core.lx));
++      }
++    }
++    model.Minimize(100 * corner_distance + origin_distance);
++  }
++
++  Model sat_model;
++  const CpSolverResponse response = SolveCpModel(model.Build(), &sat_model);
++  if (isFeasible(response)) {
++    return {macro.id,
++            static_cast<double>(SolutionIntegerValue(response, x)),
++            static_cast<double>(SolutionIntegerValue(response, y))};
++  }
++  return location;
++}
++
++}  // namespace
++
++std::vector<SolverPlacement> MacroPlacementSolver::legalizeMacros(
++    const SolverCore& core,
++    const std::vector<SolverRect>& movable_macros,
++    const std::vector<SolverRect>& fixed_macros,
++    const double max_time_in_seconds) const
++{
++  CpModelBuilder cp_model;
++  std::unordered_map<int, IntVar> x_vars;
++  std::unordered_map<int, IntVar> y_vars;
++  auto no_overlap = cp_model.AddNoOverlap2D();
++
++  const int64_t core_l = roundToInt(core.lx);
++  const int64_t core_r = roundToInt(core.ux);
++  const int64_t core_b = roundToInt(core.ly);
++  const int64_t core_t = roundToInt(core.uy);
++
++  for (const SolverRect& macro : movable_macros) {
++    const int64_t width = roundToInt(macro.ux - macro.lx);
++    const int64_t height = roundToInt(macro.uy - macro.ly);
++    const IntVar x = cp_model.NewIntVar(Domain(core_l, core_r - width))
++                         .WithName("x_" + std::to_string(macro.id));
++    const IntVar y = cp_model.NewIntVar(Domain(core_b, core_t - height))
++                         .WithName("y_" + std::to_string(macro.id));
++    x_vars.emplace(macro.id, x);
++    y_vars.emplace(macro.id, y);
++    no_overlap.AddRectangle(cp_model.NewIntervalVar(x, width, x + width),
++                            cp_model.NewIntervalVar(y, height, y + height));
++  }
++
++  for (const SolverRect& macro : movable_macros) {
++    const int64_t width = roundToInt(macro.ux - macro.lx);
++    const int64_t height = roundToInt(macro.uy - macro.ly);
++    const IntVar& x = x_vars.at(macro.id);
++    const IntVar& y = y_vars.at(macro.id);
++
++    for (const SolverRect& fixed : fixed_macros) {
++      const int64_t fx_l = roundToInt(fixed.lx);
++      const int64_t fx_r = roundToInt(fixed.ux);
++      const int64_t fy_b = roundToInt(fixed.ly);
++      const int64_t fy_t = roundToInt(fixed.uy);
++
++      const BoolVar left = cp_model.NewBoolVar();
++      const BoolVar right = cp_model.NewBoolVar();
++      const BoolVar down = cp_model.NewBoolVar();
++      const BoolVar up = cp_model.NewBoolVar();
++
++      cp_model.AddLessOrEqual(x + width, fx_l).OnlyEnforceIf(left);
++      cp_model.AddGreaterThan(x + width, fx_l).OnlyEnforceIf(left.Not());
++      cp_model.AddLessOrEqual(fx_r, x).OnlyEnforceIf(right);
++      cp_model.AddGreaterThan(fx_r, x).OnlyEnforceIf(right.Not());
++      cp_model.AddLessOrEqual(y + height, fy_b).OnlyEnforceIf(down);
++      cp_model.AddGreaterThan(y + height, fy_b).OnlyEnforceIf(down.Not());
++      cp_model.AddLessOrEqual(fy_t, y).OnlyEnforceIf(up);
++      cp_model.AddGreaterThan(fy_t, y).OnlyEnforceIf(up.Not());
++      cp_model.AddBoolOr({left, right, down, up});
++    }
++  }
++
++  std::vector<LinearExpr> distances;
++  for (const SolverRect& macro : movable_macros) {
++    const int64_t width = roundToInt(macro.ux - macro.lx);
++    const int64_t height = roundToInt(macro.uy - macro.ly);
++    const IntVar dx = newAbsVar(cp_model,
++                                x_vars.at(macro.id) - roundToInt(macro.lx),
++                                core_r - width,
++                                "dx_" + std::to_string(macro.id));
++    const IntVar dy = newAbsVar(cp_model,
++                                y_vars.at(macro.id) - roundToInt(macro.ly),
++                                core_t - height,
++                                "dy_" + std::to_string(macro.id));
++    distances.push_back(dx + dy);
++  }
++  cp_model.Minimize(sumExprs(distances));
++
++  Model model;
++  setTimeLimit(model, max_time_in_seconds);
++  const CpSolverResponse response = SolveCpModel(cp_model.Build(), &model);
++  if (!isFeasible(response)) {
++    return {};
++  }
++
++  std::vector<SolverPlacement> result;
++  for (const SolverRect& macro : movable_macros) {
++    result.push_back({macro.id,
++                      static_cast<double>(SolutionIntegerValue(response, x_vars.at(macro.id))),
++                      static_cast<double>(SolutionIntegerValue(response, y_vars.at(macro.id)))});
++  }
++  return result;
++}
++
++std::vector<SolverPlacement> MacroPlacementSolver::placeMacrosInCluster(
++    const double layout_width,
++    const double layout_height,
++    const std::vector<SolverMacro>& macros,
++    const std::vector<SolverWeightedNet>& nets,
++    const bool use_long_time_limit) const
++{
++  const auto initial = greedyInitialPlacement(layout_width, layout_height, macros, nets);
++  const double coarse_limit = use_long_time_limit ? 30.0 : (macros.size() > 10 ? 10.0 : 5.0);
++  const double fine_limit = use_long_time_limit ? 30.0 : (macros.size() > 10 ? 10.0 : 5.0);
++  const auto coarse = coarseClusterSolve(layout_width, layout_height, macros, nets, initial, coarse_limit);
++  if (coarse.size() != macros.size()) {
++    return completePlacementFallback(macros, initial);
++  }
++  return fineClusterSolve(layout_width, layout_height, macros, nets, coarse, fine_limit);
++}
++
++std::vector<SolverPlacement> MacroPlacementSolver::coarseClusterSolve(
++    const double layout_width,
++    const double layout_height,
++    const std::vector<SolverMacro>& macros,
++    const std::vector<SolverWeightedNet>& nets,
++    const std::unordered_map<int, SolverPlacement>& initial,
++    const double max_time_in_seconds) const
++{
++  CpModelBuilder cp_model;
++  const int64_t coarse_width = roundToInt(layout_width / kGridSize);
++  const int64_t coarse_height = roundToInt(layout_height / kGridSize);
++
++  std::unordered_map<int, IntVar> x_vars;
++  std::unordered_map<int, IntVar> y_vars;
++  auto no_overlap = cp_model.AddNoOverlap2D();
++
++  for (const SolverMacro& macro : macros) {
++    const int64_t width = gridSpan(macro.width);
++    const int64_t height = gridSpan(macro.height);
++    const IntVar x = cp_model.NewIntVar(Domain(0, std::max<int64_t>(0, coarse_width - width)))
++                         .WithName("x_" + std::to_string(macro.id));
++    const IntVar y = cp_model.NewIntVar(Domain(0, std::max<int64_t>(0, coarse_height - height)))
++                         .WithName("y_" + std::to_string(macro.id));
++    x_vars.emplace(macro.id, x);
++    y_vars.emplace(macro.id, y);
++    no_overlap.AddRectangle(cp_model.NewIntervalVar(x, width, x + width),
++                            cp_model.NewIntervalVar(y, height, y + height));
++
++    const auto hint = initial.find(macro.id);
++    if (hint != initial.end()) {
++      cp_model.AddHint(x, roundToInt(hint->second.x / kGridSize));
++      cp_model.AddHint(y, roundToInt(hint->second.y / kGridSize));
++    }
++  }
++
++  std::vector<LinearExpr> distances;
++  for (const SolverWeightedNet& net : nets) {
++    if (x_vars.find(net.source) == x_vars.end() || x_vars.find(net.target) == x_vars.end()) {
++      continue;
++    }
++    const auto source_macro = std::find_if(macros.begin(), macros.end(), [&net](const SolverMacro& macro) {
++      return macro.id == net.source;
++    });
++    const auto target_macro = std::find_if(macros.begin(), macros.end(), [&net](const SolverMacro& macro) {
++      return macro.id == net.target;
++    });
++    if (source_macro == macros.end() || target_macro == macros.end()) {
++      continue;
++    }
++    const int64_t source_width = gridSpan(source_macro->width);
++    const int64_t target_width = gridSpan(target_macro->width);
++    const int64_t source_height = gridSpan(source_macro->height);
++    const int64_t target_height = gridSpan(target_macro->height);
++    const IntVar dx = newAbsVar(cp_model,
++                                2 * x_vars.at(net.source) + source_width
++                                    - (2 * x_vars.at(net.target) + target_width),
++                                2 * coarse_width,
++                                "dx_" + std::to_string(net.source) + "_" + std::to_string(net.target));
++    const IntVar dy = newAbsVar(cp_model,
++                                2 * y_vars.at(net.source) + source_height
++                                    - (2 * y_vars.at(net.target) + target_height),
++                                2 * coarse_height,
++                                "dy_" + std::to_string(net.source) + "_" + std::to_string(net.target));
++    distances.push_back(roundToInt(net.weight) * (dx + dy));
++  }
++  cp_model.Minimize(sumExprs(distances));
++
++  Model model;
++  setTimeLimit(model, max_time_in_seconds);
++  const CpSolverResponse response = SolveCpModel(cp_model.Build(), &model);
++  if (!isFeasible(response)) {
++    return {};
++  }
++
++  std::vector<SolverPlacement> result;
++  for (const SolverMacro& macro : macros) {
++    result.push_back({macro.id,
++                      static_cast<double>(SolutionIntegerValue(response, x_vars.at(macro.id))),
++                      static_cast<double>(SolutionIntegerValue(response, y_vars.at(macro.id)))});
++  }
++  return result;
++}
++
++std::vector<SolverPlacement> MacroPlacementSolver::fineClusterSolve(
++    const double layout_width,
++    const double layout_height,
++    const std::vector<SolverMacro>& macros,
++    const std::vector<SolverWeightedNet>& nets,
++    const std::vector<SolverPlacement>& coarse_result,
++    const double max_time_in_seconds) const
++{
++  CpModelBuilder cp_model;
++  const auto coarse_map = toPlacementMap(coarse_result);
++  std::unordered_map<int, IntVar> x_vars;
++  std::unordered_map<int, IntVar> y_vars;
++  auto no_overlap = cp_model.AddNoOverlap2D();
++
++  for (const SolverMacro& macro : macros) {
++    const int64_t width = roundToInt(macro.width);
++    const int64_t height = roundToInt(macro.height);
++    int64_t cx = 0;
++    int64_t cy = 0;
++    const auto coarse_it = coarse_map.find(macro.id);
++    if (coarse_it != coarse_map.end()) {
++      cx = roundToInt(coarse_it->second.x * kGridSize);
++      cy = roundToInt(coarse_it->second.y * kGridSize);
++    }
++    const int64_t max_x = std::max<int64_t>(0, roundToInt(layout_width) - width);
++    const int64_t max_y = std::max<int64_t>(0, roundToInt(layout_height) - height);
++    const int64_t low_x = std::max<int64_t>(cx - 2 * kGridSize, 0);
++    const int64_t high_x = std::min<int64_t>(cx + 2 * kGridSize, max_x);
++    const int64_t low_y = std::max<int64_t>(cy - 2 * kGridSize, 0);
++    const int64_t high_y = std::min<int64_t>(cy + 2 * kGridSize, max_y);
++    const IntVar x = cp_model.NewIntVar(Domain(low_x, std::max(low_x, high_x)))
++                         .WithName("x_" + std::to_string(macro.id));
++    const IntVar y = cp_model.NewIntVar(Domain(low_y, std::max(low_y, high_y)))
++                         .WithName("y_" + std::to_string(macro.id));
++    x_vars.emplace(macro.id, x);
++    y_vars.emplace(macro.id, y);
++    no_overlap.AddRectangle(cp_model.NewIntervalVar(x, width, x + width),
++                            cp_model.NewIntervalVar(y, height, y + height));
++  }
++
++  std::vector<LinearExpr> distances;
++  for (const SolverWeightedNet& net : nets) {
++    if (x_vars.find(net.source) == x_vars.end() || x_vars.find(net.target) == x_vars.end()) {
++      continue;
++    }
++    const auto source_macro = std::find_if(macros.begin(), macros.end(), [&net](const SolverMacro& macro) {
++      return macro.id == net.source;
++    });
++    const auto target_macro = std::find_if(macros.begin(), macros.end(), [&net](const SolverMacro& macro) {
++      return macro.id == net.target;
++    });
++    if (source_macro == macros.end() || target_macro == macros.end()) {
++      continue;
++    }
++    const int64_t source_width = roundToInt(source_macro->width);
++    const int64_t target_width = roundToInt(target_macro->width);
++    const int64_t source_height = roundToInt(source_macro->height);
++    const int64_t target_height = roundToInt(target_macro->height);
++    const IntVar dx = newAbsVar(cp_model,
++                                2 * x_vars.at(net.source) + source_width
++                                    - (2 * x_vars.at(net.target) + target_width),
++                                2 * roundToInt(layout_width),
++                                "dx_" + std::to_string(net.source) + "_" + std::to_string(net.target));
++    const IntVar dy = newAbsVar(cp_model,
++                                2 * y_vars.at(net.source) + source_height
++                                    - (2 * y_vars.at(net.target) + target_height),
++                                2 * roundToInt(layout_height),
++                                "dy_" + std::to_string(net.source) + "_" + std::to_string(net.target));
++    distances.push_back(roundToInt(net.weight) * (dx + dy));
++  }
++  cp_model.Minimize(sumExprs(distances));
++
++  Model model;
++  setTimeLimit(model, max_time_in_seconds);
++  const CpSolverResponse response = SolveCpModel(cp_model.Build(), &model);
++  if (!isFeasible(response)) {
++    if (coarse_result.size() != macros.size()) {
++      return completePlacementFallback(macros, {});
++    }
++    std::vector<SolverPlacement> fallback;
++    for (const SolverPlacement& placement : coarse_result) {
++      fallback.push_back({placement.id, placement.x * kGridSize, placement.y * kGridSize});
++    }
++    return fallback;
++  }
++
++  std::vector<SolverPlacement> result;
++  for (const SolverMacro& macro : macros) {
++    result.push_back({macro.id,
++                      static_cast<double>(SolutionIntegerValue(response, x_vars.at(macro.id))),
++                      static_cast<double>(SolutionIntegerValue(response, y_vars.at(macro.id)))});
++  }
++  return result;
++}
++
++std::vector<SolverPlacement> MacroPlacementSolver::moveMacroGroupsToBoundary(
++    const SolverCore& core,
++    const std::vector<SolverMacro>& macro_groups,
++    const std::unordered_map<int, SolverPlacement>& locations,
++    const char* block_name) const
++{
++  int64_t halo = 10;
++  const std::string name = block_name == nullptr ? "" : block_name;
++  if (name == "mor1kx" || name == "eth_top" || name == "or1200_top") {
++    halo = 2;
++  }
++
++  std::vector<SolverMacro> sorted_groups = macro_groups;
++  std::sort(sorted_groups.begin(),
++            sorted_groups.end(),
++            [](const SolverMacro& lhs, const SolverMacro& rhs) {
++              const double lhs_area = lhs.width * lhs.height;
++              const double rhs_area = rhs.width * rhs.height;
++              if (lhs_area == rhs_area) {
++                return lhs.id < rhs.id;
++              }
++              return lhs_area > rhs_area;
++            });
++
++  std::unordered_map<int, SolverMacro> fixed_shapes;
++  std::unordered_map<int, SolverPlacement> fixed_locations;
++  for (const SolverMacro& group : sorted_groups) {
++    const auto loc_it = locations.find(group.id);
++    if (loc_it == locations.end()) {
++      continue;
++    }
++    const SolverPlacement moved = solveBoundaryStage(
++        core, group, loc_it->second, fixed_shapes, fixed_locations, halo);
++    fixed_shapes[group.id] = group;
++    fixed_locations[group.id] = moved;
++  }
++
++  if (sorted_groups.size() <= 1) {
++    std::vector<SolverPlacement> result;
++    for (const auto& [id, placement] : fixed_locations) {
++      result.push_back(placement);
++    }
++    return result;
++  }
++
++  CpModelBuilder model;
++  std::unordered_map<int, IntVar> x_vars;
++  std::unordered_map<int, IntVar> y_vars;
++  auto no_overlap = model.AddNoOverlap2D();
++  bool first = true;
++  int fixed_id = -1;
++  for (const SolverMacro& group : sorted_groups) {
++    const SolverPlacement& location = fixed_locations.at(group.id);
++    if (first) {
++      first = false;
++      fixed_id = group.id;
++      continue;
++    }
++    const int64_t width = roundToInt(group.width);
++    const int64_t height = roundToInt(group.height);
++    const IntVar x = model.NewIntVar(Domain(roundToInt(core.lx), roundToInt(core.ux) - width))
++                         .WithName("x_" + std::to_string(group.id));
++    const IntVar y = model.NewIntVar(Domain(roundToInt(core.ly), roundToInt(core.uy) - height))
++                         .WithName("y_" + std::to_string(group.id));
++    x_vars.emplace(group.id, x);
++    y_vars.emplace(group.id, y);
++    no_overlap.AddRectangle(model.NewIntervalVar(x - halo, width + 2 * halo, x + width + halo),
++                            model.NewIntervalVar(y - halo, height + 2 * halo, y + height + halo));
++    (void) location;
++  }
++
++  const SolverMacro& fixed_shape = fixed_shapes.at(fixed_id);
++  const SolverPlacement& fixed_location = fixed_locations.at(fixed_id);
++  const int64_t fx_l = roundToInt(fixed_location.x) - halo;
++  const int64_t fx_r = roundToInt(fixed_location.x + fixed_shape.width) + halo;
++  const int64_t fy_b = roundToInt(fixed_location.y) - halo;
++  const int64_t fy_t = roundToInt(fixed_location.y + fixed_shape.height) + halo;
++  for (const SolverMacro& group : sorted_groups) {
++    if (group.id == fixed_id) {
++      continue;
++    }
++    const int64_t width = roundToInt(group.width);
++    const int64_t height = roundToInt(group.height);
++    const IntVar& x = x_vars.at(group.id);
++    const IntVar& y = y_vars.at(group.id);
++    const BoolVar left = model.NewBoolVar();
++    const BoolVar right = model.NewBoolVar();
++    const BoolVar down = model.NewBoolVar();
++    const BoolVar up = model.NewBoolVar();
++    model.AddLessOrEqual(x + width, fx_l).OnlyEnforceIf(left);
++    model.AddGreaterThan(x + width, fx_l).OnlyEnforceIf(left.Not());
++    model.AddLessOrEqual(fx_r, x).OnlyEnforceIf(right);
++    model.AddGreaterThan(fx_r, x).OnlyEnforceIf(right.Not());
++    model.AddLessOrEqual(y + height, fy_b).OnlyEnforceIf(down);
++    model.AddGreaterThan(y + height, fy_b).OnlyEnforceIf(down.Not());
++    model.AddLessOrEqual(fy_t, y).OnlyEnforceIf(up);
++    model.AddGreaterThan(fy_t, y).OnlyEnforceIf(up.Not());
++    model.AddBoolOr({left, right, down, up});
++  }
++
++  const double core_width = core.ux - core.lx;
++  const double core_height = core.uy - core.ly;
++  std::vector<LinearExpr> distances;
++  for (const SolverMacro& group : sorted_groups) {
++    if (group.id == fixed_id) {
++      continue;
++    }
++    const SolverPlacement& origin = fixed_locations.at(group.id);
++    const int64_t width = roundToInt(group.width);
++    const int64_t height = roundToInt(group.height);
++    const IntVar dx = newAbsVar(model, x_vars.at(group.id) - roundToInt(origin.x), roundToInt(core.ux), "dx_" + std::to_string(group.id));
++    const IntVar dy = newAbsVar(model, y_vars.at(group.id) - roundToInt(origin.y), roundToInt(core.uy), "dy_" + std::to_string(group.id));
++    const int64_t weight = roundToInt((group.width / 20.0) * (group.height / 20.0));
++    if (origin.x > core.lx + 0.2 * core_width && origin.x < core.ux - 0.2 * core_width
++        && origin.y < core.ly + 0.2 * core_height) {
++      distances.push_back((dx + 5 * dy) * weight);
++    } else if (origin.x > core.lx + 0.2 * core_width && origin.x < core.ux - 0.2 * core_width
++               && origin.y > core.uy - 0.2 * core_height) {
++      distances.push_back((dx + 5 * dy) * weight);
++    } else if (origin.y > core.ly + 0.2 * core_height && origin.y < core.uy - 0.2 * core_height
++               && origin.x < core.lx + 0.2 * core_width) {
++      distances.push_back((5 * dx + dy) * weight);
++    } else if (origin.y > core.ly + 0.2 * core_height && origin.y < core.uy - 0.2 * core_height
++               && origin.x > core.ux - 0.2 * core_width) {
++      distances.push_back((5 * dx + dy) * weight);
++    } else {
++      distances.push_back((dx + dy) * weight);
++    }
++    (void) width;
++    (void) height;
++  }
++  model.Minimize(sumExprs(distances));
++
++  Model sat_model;
++  setTimeLimit(sat_model, 10.0);
++  const CpSolverResponse response = SolveCpModel(model.Build(), &sat_model);
++  std::vector<SolverPlacement> result;
++  result.push_back(fixed_location);
++  for (const SolverMacro& group : sorted_groups) {
++    if (group.id == fixed_id) {
++      continue;
++    }
++    if (isFeasible(response)) {
++      result.push_back({group.id,
++                        static_cast<double>(SolutionIntegerValue(response, x_vars.at(group.id))),
++                        static_cast<double>(SolutionIntegerValue(response, y_vars.at(group.id)))});
++    } else {
++      result.push_back(fixed_locations.at(group.id));
++    }
++  }
++  return result;
++}
++
++}  // namespace mpl2
+diff --git a/src/mpl2/src/MacroPlacementSolver.h b/src/mpl2/src/MacroPlacementSolver.h
+new file mode 100644
+index 000000000..84a2eb585
+--- /dev/null
++++ b/src/mpl2/src/MacroPlacementSolver.h
+@@ -0,0 +1,89 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#pragma once
++
++#include <cstdint>
++#include <optional>
++#include <unordered_map>
++#include <vector>
++
++namespace mpl2 {
++
++struct SolverRect
++{
++  int id = 0;
++  double lx = 0.0;
++  double ly = 0.0;
++  double ux = 0.0;
++  double uy = 0.0;
++};
++
++struct SolverMacro
++{
++  int id = 0;
++  double width = 0.0;
++  double height = 0.0;
++};
++
++struct SolverWeightedNet
++{
++  int source = 0;
++  int target = 0;
++  double weight = 0.0;
++};
++
++struct SolverPlacement
++{
++  int id = 0;
++  double x = 0.0;
++  double y = 0.0;
++};
++
++struct SolverCore
++{
++  double lx = 0.0;
++  double ly = 0.0;
++  double ux = 0.0;
++  double uy = 0.0;
++};
++
++class MacroPlacementSolver
++{
++ public:
++  std::vector<SolverPlacement> legalizeMacros(
++      const SolverCore& core,
++      const std::vector<SolverRect>& movable_macros,
++      const std::vector<SolverRect>& fixed_macros,
++      double max_time_in_seconds = 10.0) const;
++
++  std::vector<SolverPlacement> placeMacrosInCluster(
++      double layout_width,
++      double layout_height,
++      const std::vector<SolverMacro>& macros,
++      const std::vector<SolverWeightedNet>& nets,
++      bool use_long_time_limit) const;
++
++  std::vector<SolverPlacement> moveMacroGroupsToBoundary(
++      const SolverCore& core,
++      const std::vector<SolverMacro>& macro_groups,
++      const std::unordered_map<int, SolverPlacement>& locations,
++      const char* block_name) const;
++
++ private:
++  std::vector<SolverPlacement> coarseClusterSolve(
++      double layout_width,
++      double layout_height,
++      const std::vector<SolverMacro>& macros,
++      const std::vector<SolverWeightedNet>& nets,
++      const std::unordered_map<int, SolverPlacement>& initial,
++      double max_time_in_seconds) const;
++
++  std::vector<SolverPlacement> fineClusterSolve(
++      double layout_width,
++      double layout_height,
++      const std::vector<SolverMacro>& macros,
++      const std::vector<SolverWeightedNet>& nets,
++      const std::vector<SolverPlacement>& coarse_result,
++      double max_time_in_seconds) const;
++};
++
++}  // namespace mpl2
+diff --git a/src/mpl2/src/clusterEngine.cpp b/src/mpl2/src/clusterEngine.cpp
+index 75aa76d07..511f17538 100644
+--- a/src/mpl2/src/clusterEngine.cpp
++++ b/src/mpl2/src/clusterEngine.cpp
+@@ -56,9 +56,9 @@ void ClusteringEngine::run()
+   design_metrics_ = computeModuleMetrics(block_->getTopModule());
+   init();
+ 
+-  if (!tree_->has_unfixed_macros) {
+-    return;
+-  }
++  // if (!tree_->has_unfixed_macros) {
++  //   return;
++  // }
+ 
+   createRoot();
+   setBaseThresholds();
+@@ -89,6 +89,13 @@ void ClusteringEngine::run()
+   }
+ }
+ 
++void ClusteringEngine::increInitialize(){
++  design_metrics_ = computeModuleMetrics(block_->getTopModule());
++  init();
++  createRoot();
++}
++
++
+ void ClusteringEngine::setDesignMetrics(Metrics* design_metrics)
+ {
+   design_metrics_ = design_metrics;
+@@ -104,11 +111,11 @@ void ClusteringEngine::setTree(PhysicalHierarchy* tree)
+ void ClusteringEngine::init()
+ {
+   const std::vector<odb::dbInst*> unfixed_macros = getUnfixedMacros();
+-  if (unfixed_macros.empty()) {
+-    tree_->has_unfixed_macros = false;
+-    logger_->info(MPL, 17, "No unfixed macros.");
+-    return;
+-  }
++  // if (unfixed_macros.empty()) {
++  //   tree_->has_unfixed_macros = false;
++  //   logger_->info(MPL, 17, "No unfixed macros.");
++  //   return;
++  // }
+ 
+   tree_->macro_with_halo_area = computeMacroWithHaloArea(unfixed_macros);
+ 
+@@ -133,8 +140,9 @@ void ClusteringEngine::init()
+                    core_area);
+   }
+ 
+-  logger_->report(
++  logger_->report("Case Name: {}\n"
+       "Floorplan Outline: ({}, {}) ({}, {}),  Core Outline: ({}, {}) ({}, {})",
++      block_->getName(),
+       block_->dbuToMicrons(die.xMin()),
+       block_->dbuToMicrons(die.yMin()),
+       block_->dbuToMicrons(die.xMax()),
+diff --git a/src/mpl2/src/clusterEngine.h b/src/mpl2/src/clusterEngine.h
+index dbe218780..e57842ade 100644
+--- a/src/mpl2/src/clusterEngine.h
++++ b/src/mpl2/src/clusterEngine.h
+@@ -168,6 +168,12 @@ class ClusteringEngine
+                                std::map<int, int>& cluster_to_macro,
+                                std::set<odb::dbMaster*>& masters);
+   void clearTempMacroClusterMapping(const UniqueClusterVector& macro_clusters);
++  
++  // 添加方法:反馈dataflow
++  const auto& getDataFlow() const { return data_connections_; }
++  // 添加方法：incre的初始化
++  void increInitialize(); 
++  
+ 
+  private:
+   using UniqueClusterQueue = std::queue<std::unique_ptr<Cluster>>;
+@@ -256,7 +262,7 @@ class ClusteringEngine
+   float computeMicronArea(odb::dbInst* inst);
+ 
+   static bool isIgnoredMaster(odb::dbMaster* master);
+-
++  
+   odb::dbBlock* block_;
+   sta::dbNetwork* network_;
+   utl::Logger* logger_;
+diff --git a/src/mpl2/src/hier_rtlmp.cpp b/src/mpl2/src/hier_rtlmp.cpp
+index a52326fd9..84ec53535 100644
+--- a/src/mpl2/src/hier_rtlmp.cpp
++++ b/src/mpl2/src/hier_rtlmp.cpp
+@@ -33,52 +33,2207 @@
+ //
+ ///////////////////////////////////////////////////////////////////////////////
+ #include "hier_rtlmp.h"
++#include "MacroPlacementSolver.h"
+ 
++#include <cstdlib>
++#include <cstring>
+ #include <fstream>
+ #include <iostream>
+ #include <queue>
+ #include <thread>
++#include "Mpl2Observer.h"
++#include "SACoreHardMacro.h"
++#include "SACoreSoftMacro.h"
++#include "bus_synthesis.h"
++#include "db_sta/dbNetwork.hh"
++#include "object.h"
++#include "odb/db.h"
++#include "odb/util.h"
++#include "par/PartitionMgr.h"
++#include "sta/Liberty.hh"
++#include "utl/Logger.h"
++
++namespace mpl2 {
++
++using std::string;
++
++static string make_filename(const string& file_name)
++{
++  return std::regex_replace(file_name, std::regex("[\":<>\\|\\*\\?/]"), "--");
++}
++
++///////////////////////////////////////////////////////////
++// Class HierRTLMP
++using utl::MPL;
++
++HierRTLMP::~HierRTLMP() = default;
++
++// Constructors
++HierRTLMP::HierRTLMP(sta::dbNetwork* network, odb::dbDatabase* db, sta::dbSta* sta, utl::Logger* logger, par::PartitionMgr* tritonpart)
++    : network_(network),
++      db_(db),
++      logger_(logger),
++      tritonpart_(tritonpart),
++      sta_(sta),
++      tree_(std::make_unique<PhysicalHierarchy>())
++{
++}
++
++// Top Level Function
++// The flow of our MacroPlacer is divided into 6 stages.
++// 1) Multilevel Autoclustering:
++//      Transform logical hierarchy into physical hierarchy.
++// 2) Coarse Shaping -> Bottom - Up:
++//      Determine the rough shape function for each cluster.
++// 3) Fine Shaping -> Top - Down:
++//      Refine the possible shapes of each cluster based on the fixed
++//      outline and location of its parent cluster.
++//      *This is executed within hierarchical placement method.
++// 4) Hierarchical Macro Placement -> Top - Down
++//      a) Placement of Clusters (one level at a time);
++//      b) Placement of Macros (one macro cluster at a time).
++// 5) Boundary Pushing
++//      Push macro clusters to the boundaries of the design if they don't
++//      overlap with either bundled IOs' blockages or other macros.
++// 6) Orientation Improvement
++//      Attempts macro flipping to improve WR.
++void HierRTLMP::run()
++{
++  // 获取程序开始时间
++  auto start = std::chrono::high_resolution_clock::now();
++
++  // 统计固定宏模块的数量
++
++  int total_macros = 0;
++  int fixed_macros = 0;
++
++  // block_->getInsts() 会返回 dbSet<dbInst>，直接用范围 for 循环即可
++  for (odb::dbInst* inst : block_->getInsts()) {
++      odb::dbMaster* master = inst->getMaster();
++      
++      // isBlock() 内部只是一个极快的枚举值对比
++      if (master->isBlock()) { 
++          total_macros++;
++          odb::dbPlacementStatus status = inst->getPlacementStatus();
++          
++          // 同时检查 LOCKED 和 FIRM
++          if (status == odb::dbPlacementStatus::LOCKED || 
++              status == odb::dbPlacementStatus::FIRM) {
++              fixed_macros++;
++          }
++      }
++  }
++
++  if (total_macros > 0 && fixed_macros > total_macros * 0.5) {
++    // Incremental placement is intentionally disabled until the new algorithm
++    // is reintroduced; use the global flow as the temporary fallback.
++    GlobalMacroPlacement();
++  } else {
++      GlobalMacroPlacement();
++  }
++
++  // bool Incre_flag = false;
++  // for (odb::dbInst* inst : block_->getInsts()) {
++  //     odb::dbMaster* master = inst->getMaster();
++  //     if (master->isBlock()) {  // 只检查宏
++  //         if (inst->getPlacementStatus() == odb::dbPlacementStatus::LOCKED){
++  //           Incre_flag = true;
++  //           break;
++  //         }
++  //     }
++  // }
++
++  // if(Incre_flag){
++  //   IncrementalMacroPlacement();
++  // }else{
++  //   GlobalMacroPlacement();
++  // }
++
++  // 计算运行时间
++  auto end = std::chrono::high_resolution_clock::now();
++  std::chrono::duration<double> duration = end - start;
++  std::cout << "总运行时间: " << duration.count() << " 秒" << std::endl;
++  clear();
++}
++
++void HierRTLMP::GlobalMacroPlacement(){
++  runMultilevelAutoclustering();
++
++  if (skip_macro_placement_) {
++    logger_->info(MPL, 13, "Skipping macro placement.");
++    return;
++  }
++  if (!tree_->has_std_cells) {
++    resetSAParameters();
++  }
++  std::unique_ptr<Mpl2Observer> save_graphics;
++  if (is_debug_only_final_result_) {
++    save_graphics = std::move(graphics_);
++  }
++  
++  runCoarseShaping();
++
++  // 😀👆
++  runNewMacroPlacement();
++  // 🐂🐎
++
++  // runHierarchicalMacroPlacement();
++  // if (save_graphics) {
++  //   graphics_ = std::move(save_graphics);
++  //   graphics_->setMaxLevel(tree_->max_level);
++  //   graphics_->drawResult();
++  // }
++  // Pusher pusher(logger_, tree_->root.get(), block_, boundary_to_io_blockage_);
++  // pusher.pushMacrosToCoreBoundaries();
++  // updateMacrosOnDb();
++  // generateTemporaryStdCellsPlacement(tree_->root.get());
++  // correctAllMacrosOrientation();
++  // commitMacroPlacementToDb();
++  // writeMacroPlacement(macro_placement_file_);
++
++}
++
++void HierRTLMP::init()
++{
++  block_ = db_->getChip()->getBlock();
++}
++
++////////////////////////////////////////////////////////////////////////
++// Private functions
++////////////////////////////////////////////////////////////////////////
++
++// 添加的修改布局方法的函数
++void HierRTLMP::runNewMacroPlacement(){
++
++  // 更新连接和数据流
++  for (auto& cluster : tree_->root->getChildren()) {
++    clustering_engine_->updateInstancesAssociation(cluster.get());
++  }
++  clustering_engine_->updateConnections();
++  clustering_engine_->updateDataFlow();
++
++  // 对于顶层root,随机生成宽长比,返回id-宽长比对的map
++  shapeGenerate();
++
++  // 写聚类结果
++
++  // 改成绝对路径
++
++  
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/bloat";
++  WriteClusterResult();
++
++  // 调用replace进行扩散
++  runReplaceTcl();
++
++  // 将结果反馈回顶层簇的坐标
++  rebackRePlaceClusterLocation();
++
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/first_lp";
++
++  // 线性规划求解宏坐标
++  InitializeMacroLocation();
++
++  // 宏合法化
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/macro_legalize";
++  macroLegalize(false);
++
++  // 生成伪网络约束
++  // clusterFakeNetStdGenerate();
++
++  // 生成初始标准单元坐标，放在顶层簇的中心
++  stdCellPlacement();
++}
++
++void HierRTLMP::macroLegalize(bool incre_flag)
++{
++  std::vector<Rect> space_placed;
++  std::vector<Rect> fixed_macros;
++  std::unordered_map<int, odb::dbInst*> order_inst_map;
++  int order = 0;
++
++  if (!incre_flag) {
++    for (auto& [inst, hardmacro] : tree_->maps.inst_to_hard) {
++      float x = hardmacro->getX();
++      float y = hardmacro->getY();
++      float width = hardmacro->getWidth();
++      float height = hardmacro->getHeight();
++      space_placed.emplace_back(x, y, x + width, y + height, false);
++      order_inst_map[order] = inst;
++      order++;
++    }
++  } else {
++    for (auto hardmacro : free_critical_macros_) {
++      odb::dbInst* inst = hardmacro->getInst();
++      float x = hardmacro->getX();
++      float y = hardmacro->getY();
++      float width = hardmacro->getWidth();
++      float height = hardmacro->getHeight();
++      space_placed.emplace_back(x, y, x + width, y + height, false);
++      order_inst_map[order] = inst;
++      order++;
++    }
++
++    for (auto& [inst, fixed_macro] : tree_->maps.inst_to_hard) {
++      auto it = std::find_if(free_critical_macros_.begin(),
++                             free_critical_macros_.end(),
++                             [&inst](HardMacro* ptr) {
++                               return ptr->getInst() == inst;
++                             });
++      if (it == free_critical_macros_.end()) {
++        float x = fixed_macro->getX();
++        float y = fixed_macro->getY();
++        float width = fixed_macro->getWidth();
++        float height = fixed_macro->getHeight();
++        fixed_macros.emplace_back(x, y, x + width, y + height, false);
++      }
++    }
++  }
++
++  const odb::Rect core_box = block_->getCoreArea();
++  MacroPlacementSolver solver;
++  SolverCore core{block_->dbuToMicrons(core_box.xMin()),
++                  block_->dbuToMicrons(core_box.yMin()),
++                  block_->dbuToMicrons(core_box.xMax()),
++                  block_->dbuToMicrons(core_box.yMax())};
++  std::vector<SolverRect> movable;
++  for (int i = 0; i < static_cast<int>(space_placed.size()); ++i) {
++    const Rect& rect = space_placed[i];
++    movable.push_back({i, rect.xMin(), rect.yMin(), rect.xMax(), rect.yMax()});
++  }
++  std::vector<SolverRect> fixed;
++  for (int i = 0; i < static_cast<int>(fixed_macros.size()); ++i) {
++    const Rect& rect = fixed_macros[i];
++    fixed.push_back({i, rect.xMin(), rect.yMin(), rect.xMax(), rect.yMax()});
++  }
++  const auto placements = solver.legalizeMacros(core, movable, fixed);
++  if (placements.size() != movable.size()) {
++    logger_->warn(MPL, 1020, "Macro legalization failed to find a feasible non-overlap solution; preserving current macro locations.");
++    return;
++  }
++  for (const SolverPlacement& placement : placements) {
++    odb::dbInst* inst = order_inst_map[placement.id];
++    auto hardmacro = tree_->maps.inst_to_hard.find(inst)->second.get();
++    float new_x = placement.x;
++    float new_y = placement.y;
++    const float core_lx = static_cast<float>(block_->dbuToMicrons(core_box.xMin()));
++    const float core_ux = static_cast<float>(block_->dbuToMicrons(core_box.xMax()));
++    const float core_ly = static_cast<float>(block_->dbuToMicrons(core_box.yMin()));
++    const float core_uy = static_cast<float>(block_->dbuToMicrons(core_box.yMax()));
++    new_x = std::max(new_x, core_lx);
++    new_x = std::min(new_x, core_ux - hardmacro->getRealWidth());
++    new_y = std::max(new_y, core_ly);
++    new_y = std::min(new_y, core_uy - hardmacro->getRealHeight());
++    inst->setPlacementStatus(odb::dbPlacementStatus::PLACED);
++    hardmacro->setLocation(std::make_pair(new_x, new_y));
++    inst->setLocation(block_->micronsToDbu(new_x), block_->micronsToDbu(new_y));
++  }
++
++  for (auto& [inst, hard_macro] : tree_->maps.inst_to_hard) {
++    auto loc = inst->getLocation();
++    float x = loc.getX();
++    float y = loc.getY();
++    float width = hard_macro->getRealWidthDBU();
++    float height = hard_macro->getRealHeightDBU();
++    float new_x = x;
++    float new_y = y;
++    if (x < core_box.xMin()) {
++      new_x = core_box.xMin();
++    } else if (x + width > core_box.xMax()) {
++      new_x = core_box.xMax() - width;
++    }
++    if (y < core_box.yMin()) {
++      new_y = core_box.yMin();
++    } else if (y + height > core_box.yMax()) {
++      new_y = core_box.yMax() - height;
++    }
++    inst->setLocation(new_x, new_y);
++  }
++}
++
++void HierRTLMP::InitializeMacroLocation(){
++  // 求解一个簇之间宏的连接的线网
++  auto macro_dataflow_nets = createMacroDataflowNet(tree_->root.get());
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/first_lp";
++  // 一级线性规划，求解簇内宏的相对位置关系
++  for(auto& cluster : tree_->root->getChildren()){
++    if(cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster){
++      continue;
++    }
++    int num_macro = cluster->getMetrics().getNumMacro(); 
++    if(num_macro<2){
++      for(auto& hardmacro : cluster->getHardMacros()){
++        odb::dbInst* inst = hardmacro->getInst();
++        float cluster_center_x = cluster->getX() + id_shape_map_[cluster->getId()].first/2;
++        float cluster_center_y = cluster->getY() + id_shape_map_[cluster->getId()].second/2;
++
++        float width = hardmacro->getWidth();
++        float height = hardmacro->getHeight();
++        float x = cluster_center_x - width/2;
++        float y = cluster_center_y - height/2;
++        inst->setOrient(hardmacro->getOrientation());
++        inst->setLocation(block_->micronsToDbu(x), block_->micronsToDbu(y));
++        inst->setPlacementStatus(odb::dbPlacementStatus::PLACED);
++
++        hardmacro->setLocation(std::make_pair(x,y));
++      }
++      continue;
++    }
++    
++    FirstLinearSolver(cluster.get(), macro_dataflow_nets);
++  }
++
++  // 二级线性规划(将簇内的宏推向边缘)适用于所有的宏簇，包括单宏簇
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/second_lp";
++
++  SecondLinearSolver();
++
++
++  // 计算每个簇的宏的面积，按照降序排序
++  // 自定义比较函数，使得multiset是按照降序排列
++  // auto cmp = [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
++  //     return a.first > b.first; // 降序
++  // };
++  // std::multiset<std::pair<float, int>, decltype(cmp)> macro_area_cmp(cmp);
++
++  // // 已经放好的宏组，生成fence region
++  // std::vector<std::vector<float>> fence_region;
++
++  // for(auto& cluster : tree_->root->getChildren()){
++  //   if(cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster){
++  //     continue;
++  //   }
++  //   float sum_area = 0.0f;
++  //   for(auto hardmacro : cluster->getHardMacros()){
++  //     sum_area += hardmacro->getWidth() * hardmacro->getHeight();
++  //   }
++  //   int id = cluster->getId();
++  //   macro_area_cmp.insert({sum_area,id});
++  // }
++
++  // for (auto cmp : macro_area_cmp){
++  //   auto current = tree_->maps.id_to_cluster.find(cmp.second);
++  //   Cluster* cluster_ptr = current->second;
++  //   SecondLinearSolver(cluster_ptr, fence_region);
++  // }
++
++  // for(auto& cluster : tree_->root->getChildren()){
++  //   if(cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster){
++  //     continue;
++  //   }
++  //   SecondLinearSolver(cluster.get());
++  // }
++
++}
++
++void HierRTLMP::SecondLinearSolver(){
++  std::unordered_map<int, std::vector<float>> macro_big_rects;
++  std::unordered_map<int, std::pair<float, float>> big_rects_shape;
++  for (auto& cluster : tree_->root->getChildren()) {
++    if (cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster) {
++      continue;
++    }
++
++    std::vector<float> current_big_rect;
++    auto frontmacro = cluster->getHardMacros()[0];
++    current_big_rect.push_back(frontmacro->getRealX());
++    current_big_rect.push_back(frontmacro->getRealY());
++    current_big_rect.push_back(frontmacro->getRealX() + frontmacro->getRealWidth());
++    current_big_rect.push_back(frontmacro->getRealY() + frontmacro->getRealHeight());
++    for (auto& hardmacro : cluster->getHardMacros()) {
++      float x = hardmacro->getRealX();
++      float y = hardmacro->getRealY();
++      float width = hardmacro->getRealWidth();
++      float height = hardmacro->getRealHeight();
++      current_big_rect[0] = std::min(current_big_rect[0], x);
++      current_big_rect[1] = std::min(current_big_rect[1], y);
++      current_big_rect[2] = std::max(current_big_rect[2], x + width);
++      current_big_rect[3] = std::max(current_big_rect[3], y + height);
++    }
++    macro_big_rects[cluster->getId()] = current_big_rect;
++    big_rects_shape[cluster->getId()]
++        = {current_big_rect[2] - current_big_rect[0], current_big_rect[3] - current_big_rect[1]};
++  }
++
++  const odb::Rect core_box = block_->getCoreArea();
++  std::unordered_map<int, std::pair<float, float>> big_rects_loc;
++  for (auto& cluster : tree_->root->getChildren()) {
++    if (cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster) {
++      continue;
++    }
++    int id = cluster->getId();
++    float cluster_center_x = cluster->getX() + id_shape_map_[id].first / 2;
++    float cluster_center_y = cluster->getY() + id_shape_map_[id].second / 2;
++    float rect_x = cluster_center_x - big_rects_shape[id].first / 2;
++    float rect_y = cluster_center_y - big_rects_shape[id].second / 2;
++    if (rect_x < block_->dbuToMicrons(core_box.xMin())) {
++      rect_x = block_->dbuToMicrons(core_box.xMin());
++    } else if (rect_x + big_rects_shape[id].first > block_->dbuToMicrons(core_box.xMax())) {
++      rect_x = block_->dbuToMicrons(core_box.xMax()) - big_rects_shape[id].first;
++    }
++    if (rect_y < block_->dbuToMicrons(core_box.yMin())) {
++      rect_y = block_->dbuToMicrons(core_box.yMin());
++    } else if (rect_y + big_rects_shape[id].second > block_->dbuToMicrons(core_box.yMax())) {
++      rect_y = block_->dbuToMicrons(core_box.yMax()) - big_rects_shape[id].second;
++    }
++    big_rects_loc[id] = {rect_x, rect_y};
++  }
++
++  std::vector<SolverMacro> solver_groups;
++  std::unordered_map<int, SolverPlacement> solver_locations;
++  for (auto& [id, shape] : big_rects_shape) {
++    solver_groups.push_back({id, shape.first, shape.second});
++    solver_locations[id] = {id, big_rects_loc[id].first, big_rects_loc[id].second};
++  }
++  SolverCore core{block_->dbuToMicrons(core_box.xMin()),
++                  block_->dbuToMicrons(core_box.yMin()),
++                  block_->dbuToMicrons(core_box.xMax()),
++                  block_->dbuToMicrons(core_box.yMax())};
++  MacroPlacementSolver solver;
++  const auto placements = solver.moveMacroGroupsToBoundary(
++      core, solver_groups, solver_locations, block_->getName().c_str());
++
++  std::unordered_map<int, std::pair<float, float>> macro_move;
++  for (const SolverPlacement& placement : placements) {
++    macro_move[placement.id] = {placement.x - macro_big_rects[placement.id][0],
++                                placement.y - macro_big_rects[placement.id][1]};
++  }
++
++  std::unordered_map<int, std::pair<float, float>> boundary_move;
++  std::unordered_map<odb::dbInst*, std::pair<float, float>> macro_loc;
++  for (auto& cluster : tree_->root->getChildren()) {
++    if (cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster) {
++      continue;
++    }
++    int id = cluster->getId();
++    boundary_move[id] = {0, 0};
++    for (auto& hardmacro : cluster->getHardMacros()) {
++      float x = hardmacro->getRealX() + macro_move[id].first;
++      float y = hardmacro->getRealY() + macro_move[id].second;
++      odb::dbInst* inst = hardmacro->getInst();
++      macro_loc[inst] = {x, y};
++      if (x < block_->dbuToMicrons(core_box.xMin())) {
++        boundary_move[id].first++;
++      } else if (x + hardmacro->getRealWidth() > block_->dbuToMicrons(core_box.xMax())) {
++        boundary_move[id].first--;
++      }
++      if (y < block_->dbuToMicrons(core_box.yMin())) {
++        boundary_move[id].second++;
++      } else if (y + hardmacro->getRealHeight() > block_->dbuToMicrons(core_box.yMax())) {
++        boundary_move[id].second--;
++      }
++    }
++
++    for (auto& hardmacro : cluster->getHardMacros()) {
++      odb::dbInst* inst = hardmacro->getInst();
++      float x = macro_loc[inst].first + boundary_move[id].first;
++      float y = macro_loc[inst].second + boundary_move[id].second;
++      hardmacro->setRealLocation(std::make_pair(x, y));
++      inst->setLocation(block_->micronsToDbu(x), block_->micronsToDbu(y));
++      inst->setPlacementStatus(odb::dbPlacementStatus::LOCKED);
++    }
++  }
++}
++
++void HierRTLMP::SecondLinearSolver(Cluster* cluster, std::vector<std::vector<float>>& fence_region)
++{
++  // This overload was already disabled by the caller. Keep it as a no-op so
++  // mpl2 no longer shells out to the old second_lp executable if it is called
++  // accidentally before the model is reintroduced in C++.
++  (void) cluster;
++  (void) fence_region;
++}
++
++void HierRTLMP::FirstLinearSolver(Cluster* cluster, std::vector<MacroDataflowNet> macro_dataflow_nets){
++  std::pair<float, float> final_tiling(0, 0);
++  for (auto& tiling : cluster->getMacroTilings()) {
++    final_tiling.first = std::max(final_tiling.first, tiling.first);
++    final_tiling.second = std::max(final_tiling.second, tiling.second);
++  }
++  final_tiling.first = std::max(final_tiling.first, id_shape_map_[cluster->getId()].first);
++  final_tiling.second = std::max(final_tiling.second, id_shape_map_[cluster->getId()].second);
++
++  std::pair<float, float> min_width_height(0.0f, 0.0f);
++  for (auto hardmacro : cluster->getHardMacros()) {
++    min_width_height.first += hardmacro->getWidth();
++    min_width_height.second += hardmacro->getHeight();
++  }
++  final_tiling.first = std::max(final_tiling.first, min_width_height.first);
++  final_tiling.second = std::max(final_tiling.second, min_width_height.second);
++  final_tiling.first *= 2;
++  final_tiling.second *= 2;
++
++  const odb::Rect core_box = block_->getCoreArea();
++  final_tiling.first = std::min(final_tiling.first, static_cast<float>(block_->dbuToMicrons(core_box.xMax() - core_box.xMin())));
++  final_tiling.second = std::min(final_tiling.second, static_cast<float>(block_->dbuToMicrons(core_box.yMax() - core_box.yMin())));
++
++  auto hardmacros = cluster->getHardMacros();
++  auto first_master = hardmacros[0]->getInst()->getMaster();
++  bool same_type = true;
++  for (auto hardmacro : hardmacros) {
++    if (hardmacro->getInst()->getMaster() != first_master) {
++      same_type = false;
++      break;
++    }
++  }
++  if (same_type) {
++    auto num_tiling = SameMacroBestTiling(cluster);
++    final_tiling.first = (num_tiling.first + 0.5) * hardmacros[0]->getWidth();
++    final_tiling.second = (num_tiling.second + 0.5) * hardmacros[0]->getHeight();
++  }
++
++  std::unordered_map<int, odb::dbInst*> order_inst;
++  std::vector<SolverMacro> solver_macros;
++  int order = 0;
++  for (auto hardmacro : cluster->getHardMacros()) {
++    solver_macros.push_back({order, hardmacro->getWidth(), hardmacro->getHeight()});
++    order_inst.emplace(order, hardmacro->getInst());
++    order++;
++  }
++
++  std::vector<HardMacro*> children_macro = cluster->getHardMacros();
++  std::vector<std::vector<float>> id_weight;
++  for (auto& net : macro_dataflow_nets) {
++    int driver_id = 0;
++    int load_id = 0;
++    odb::dbInst* driver_inst = net.driver_inst;
++    odb::dbInst* load_inst = net.load_inst;
++    auto driver_macro = tree_->maps.inst_to_hard.find(driver_inst)->second.get();
++    if (std::find(children_macro.begin(), children_macro.end(), driver_macro) == children_macro.end()) {
++      continue;
++    }
++    auto load_macro = tree_->maps.inst_to_hard.find(load_inst)->second.get();
++    if (std::find(children_macro.begin(), children_macro.end(), load_macro) == children_macro.end()) {
++      continue;
++    }
++    for (auto& [macro_order, inst] : order_inst) {
++      if (inst == driver_inst) {
++        driver_id = macro_order;
++      }
++      if (inst == load_inst) {
++        load_id = macro_order;
++      }
++    }
++    id_weight.push_back({static_cast<float>(driver_id), static_cast<float>(load_id), net.weight});
++  }
++
++  std::vector<std::vector<float>> rows_to_remove;
++  for (const auto& current : id_weight) {
++    if (current[0] > current[1]) {
++      rows_to_remove.push_back(current);
++    }
++  }
++  std::vector<std::vector<float>> id_increse_weight = id_weight;
++  for (const auto& row : rows_to_remove) {
++    id_increse_weight.erase(std::remove_if(id_increse_weight.begin(),
++                                           id_increse_weight.end(),
++                                           [&row](const std::vector<float>& r) {
++                                             return r.size() >= 2 && r[0] == row[0] && r[1] == row[1];
++                                           }),
++                            id_increse_weight.end());
++  }
++  for (const auto& row : rows_to_remove) {
++    id_increse_weight.erase(std::remove_if(id_increse_weight.begin(),
++                                           id_increse_weight.end(),
++                                           [&row](const std::vector<float>& r) {
++                                             return r.size() >= 2 && r[0] == row[0] && r[1] == row[1];
++                                           }),
++                            id_increse_weight.end());
++    for (auto& r : id_increse_weight) {
++      if (r.size() >= 3 && r[0] == row[1] && r[1] == row[0]) {
++        r[2] += row[2];
++      }
++    }
++  }
++
++  std::vector<SolverWeightedNet> solver_nets;
++  for (auto current : id_increse_weight) {
++    solver_nets.push_back({static_cast<int>(current[0]), static_cast<int>(current[1]), current[2]});
++  }
++
++  const bool use_long_time_limit = block_->getName() == "bp_be_top"
++                                   || block_->getName() == "bp_fe_top"
++                                   || block_->getName() == "bp_multi_top";
++  MacroPlacementSolver solver;
++  const auto placements = solver.placeMacrosInCluster(
++      final_tiling.first, final_tiling.second, solver_macros, solver_nets, use_long_time_limit);
++  if (placements.size() != solver_macros.size()) {
++    logger_->warn(MPL, 1024, "Cluster macro placement for cluster {} returned {} placements for {} macros; preserving existing locations.",
++                  cluster->getId(), placements.size(), solver_macros.size());
++    return;
++  }
++  for (const SolverPlacement& placement : placements) {
++    odb::dbInst* inst = order_inst[placement.id];
++    auto hardmacro = tree_->maps.inst_to_hard.find(inst)->second.get();
++    float true_x = placement.x + cluster->getX();
++    float true_y = placement.y + cluster->getY();
++    hardmacro->setLocation(std::make_pair(true_x, true_y));
++  }
++}
++
++std::pair<int,int> HierRTLMP::SameMacroBestTiling(Cluster* cluster){
++  // 判断是否为质数的 Lambda
++  auto isPrime = [](int n) -> bool {
++      if (n < 2) return false;
++      for (int i = 2; i * i <= n; i++) {
++          if (n % i == 0) return false;
++      }
++      return true;
++  };
++
++  // 初步
++  // float best_ratio = 1.0;
++
++  // const odb::Rect core_box = block_->getCoreArea();
++  // float best_ratio = (core_box.xMax()-core_box.xMin())/(core_box.yMax()-core_box.yMin());
++
++  auto hardmacros = cluster->getHardMacros();
++  int num_macro = hardmacros.size();
++
++  if(isPrime(num_macro)){
++    num_macro++;
++  }
++  float width = hardmacros[0]->getWidth();
++  float height = hardmacros[0]->getHeight();
++
++  int best_n = 1, best_m = num_macro;
++  float min_ratio_diff = std::max(((best_n * width) / (best_m * height)),((best_m * height) / (best_n * width)));
++
++  for(int n=1;n<sqrt(num_macro)+1;n++){
++    if(num_macro % n == 0){
++      int m = num_macro/n;
++      float temp_ratio_diff = std::max(((n * width) / (m * height)),((m * height) / (n * width)));
++      if(temp_ratio_diff < min_ratio_diff){
++        min_ratio_diff = temp_ratio_diff;
++        best_n = n;
++        best_m = m;
++      }
++
++      // 交换测试
++      int temp_n = n;
++      int temp_m = m;
++      int temp = temp_m;
++      temp_m = temp_n;
++      temp_n = temp;
++
++      float reverse_temp_ratio_diff = std::max(((temp_n * width) / (temp_m * height)),((temp_m * height) / (temp_n * width)));
++      if(reverse_temp_ratio_diff < min_ratio_diff){
++        min_ratio_diff = reverse_temp_ratio_diff;
++        best_n = temp_n;
++        best_m = temp_m;
++      }
++    }
++  }
++  return {best_n,best_m};
++}
++
++std::vector<MacroDataflowNet> HierRTLMP::createMacroDataflowNet(Cluster* parent){
++  // std::unordered_set<HardMacro*> hard_macros(parent->getHardMacros().begin(),parent->getHardMacros().end());
++  
++  std::unordered_map<std::pair<odb::dbInst*,odb::dbInst*>,MacroDataflowNet, pairHash2MacroNet> macro_dataflow_net_map;
++
++  // std::vector<MacroDataflowNet> macro_dataflow_nets;
++
++  for(auto& [driver_pin, load_inst_vectors]: clustering_engine_->getDataFlow().macro_pins_and_macros){    
++    odb::dbInst* driver_inst = driver_pin->getInst();
++    auto driver_it = tree_->maps.inst_to_hard.find(driver_inst);
++    HardMacro* driver_macro = driver_it->second.get();
++    // 如果parent中没有driver_macro，跳过
++    if(std::find(parent->getHardMacros().begin(), parent->getHardMacros().end(), driver_macro) == parent->getHardMacros().end()){
++      continue;
++    }
++
++    // 如果parent中没有driver_macro，跳过
++    // if(hard_macros.find(driver_macro) == hard_macros.end()){
++    //   continue;
++    // }
++
++    int hop = 0;
++    for(auto& load_insts : load_inst_vectors){
++      for(auto& load_inst : load_insts){  
++        // 如果parent中没有load_macro，跳过
++        auto load_it = tree_->maps.inst_to_hard.find(load_inst);
++        if(load_it == tree_->maps.inst_to_hard.end()){
++          continue;
++        }
++        HardMacro* load_macro = load_it->second.get();
++
++        if(std::find(parent->getHardMacros().begin(), parent->getHardMacros().end(), load_macro) == parent->getHardMacros().end()){
++          continue;
++        }
++
++        // if(hard_macros.find(load_macro) == hard_macros.end()){
++        //   continue;
++        // }
++
++        // 使用哈希表查找是否已经存在对应的 MacroDataflowNet
++        auto key = std::make_pair(driver_inst, load_inst);
++        auto it = macro_dataflow_net_map.find(key);
++
++        if (it != macro_dataflow_net_map.end()) {
++          // 修改其权重
++          it->second.weight += std::pow(0.5, hop);
++        } else {
++          // 新建一个 net
++          float weight = std::pow(0.5, hop);
++          macro_dataflow_net_map[key] = MacroDataflowNet(weight, driver_inst, load_inst);
++        }
++        // // 判断macro_dataflow_nets中是否有了driver_inst和load_inst对应的net
++        // auto it = std::find_if(macro_dataflow_nets.begin(), macro_dataflow_nets.end(),
++        //                        [driver_inst, load_inst](const MacroDataflowNet& net) {
++        //                          return net.driver_inst == driver_inst && net.load_inst == load_inst;
++        //                        });
++        // if(it != macro_dataflow_nets.end()){          
++        //   // 得到这个MacroDataflowNet，修改其权重
++        //   it->weight += std::pow(0.5,hop);
++        // }else{
++        //   // 如果macro_dataflow_nets中没有driver_inst和load_inst对应的net，新建一个
++        //   float weight = std::pow(0.5,hop);
++        //   macro_dataflow_nets.emplace_back(weight,driver_inst,load_inst);
++        //   // MacroDataflowNet net(weight,driver_inst,load_inst);
++        // }
++      }
++      hop++;
++    }
++  }
++
++  // 将哈希表中的值转换为 vector
++  std::vector<MacroDataflowNet> macro_dataflow_nets;
++  for (const auto& [key, net] : macro_dataflow_net_map) {
++    macro_dataflow_nets.push_back(net);
++  }
++  // 消除driver_inst和load_inst相同的net
++  macro_dataflow_nets.erase(std::remove_if(macro_dataflow_nets.begin(), macro_dataflow_nets.end(),
++                                           [](const MacroDataflowNet& net) {
++                                             return net.driver_inst == net.load_inst;
++                                           }),
++                           macro_dataflow_nets.end());
++  return macro_dataflow_nets;
++
++}
++
++void HierRTLMP::removeHardMacroOverlap(){
++  for(auto& cluster : tree_->root->getChildren()){
++
++    if(cluster->isIOCluster() || cluster->getClusterType() == StdCellCluster){
++      continue;
++    }
++
++    auto macros = cluster->getHardMacros();
++    int size = macros.size();
++    for (int i = 0; i < size; ++i) {
++      for (int j = i + 1; j < size; ++j) {
++
++        HardMacro* macroi = macros[i];
++        HardMacro* macroj = macros[j];
++        
++        // 判断二者相对位置关系
++        bool i_left = true;
++        bool i_bottom = true;
++
++        if(macroi->getX() >= macroj->getX()){
++          i_left = false;
++        }
++        if(macroi->getY() >= macroj->getY()){
++          i_bottom = false;
++        }
++
++        if(i_left){
++          if(macroi->getRealX() + macroi->getRealWidth() >= macroj->getRealX()){
++            float new_x = macroi->getRealX() +1;
++            macroi->setRealX(new_x);
++          }
++        }else{
++          if(macroj->getRealX() + macroj->getRealWidth() >= macroi->getRealX()){
++            float new_x = macroj->getRealX() +1;
++            macroi->setRealX(new_x);
++          }
++
++        }
++
++        if(i_bottom){
++
++        }else{
++
++        }
++
++      }
++    }
++  }
++
++
++  std::string path = stage_path_;
++  // 计算每个cluster的bounding box
++  std::unordered_map<int,Rect> id_box_map;
++  for(auto entry : id_shape_map_){
++    int id = entry.first;
++    float width = entry.second.first;
++    float height = entry.second.second;
++    auto current = tree_->maps.id_to_cluster.find(id);
++    Cluster* cluster_ptr = current->second;
++    id_box_map.emplace(id,Rect(cluster_ptr->getX(),cluster_ptr->getX(),cluster_ptr->getX()+width,cluster_ptr->getX()+height));
++  }
++
++  // 快速判断是否重叠的情况
++  auto is_overlap = [](Rect& a,Rect& b){
++    if(a.xMin()>=b.xMax() || a.xMax()<=b.xMin() || a.yMin()>=b.yMax() || a.yMax()<=b.yMin()){
++      return false;
++    }
++    return true;
++  };
++
++  // 计算重叠面积和区域
++  auto calculate_overlap = [](Rect& a,Rect& b){
++    float x_overlap = std::max(0.0f,std::min(a.xMax(),b.xMax())-std::max(a.xMin(),b.xMin()));
++    float y_overlap = std::max(0.0f,std::min(a.yMax(),b.yMax())-std::max(a.yMin(),b.yMin()));
++    float overlap_area = x_overlap*y_overlap;
++    // 以下两种声明方式不知道哪个对
++    // Rect overlap_coods = {std::max(a.xMin(),b.xMin()),std::max(a.yMin(),b.yMin()),std::min(a.xMax(),b.xMax()),std::min(a.yMax(),b.yMax())};
++    Rect overlap_coods(std::max(a.xMin(),b.xMin()),std::max(a.yMin(),b.yMin()),std::min(a.xMax(),b.xMax()),std::min(a.yMax(),b.yMax()));
++    
++    return std::make_pair(overlap_area,overlap_coods);
++  };
++
++  // 找宏簇和混合簇的重叠区域
++  // 遍历得到重叠的cluster以及重叠区域每加入一个cluster，就与之前的比对重叠区域
++  std::vector<int> before_cluster_id;
++  std::vector<std::pair<float,Rect>> overlap_area;
++  std::vector<std::pair<std::pair<int,int>,std::vector<std::pair<float,Rect>>>> all_overlap;
++  for(auto& current_id_box : id_box_map){
++    if(before_cluster_id.empty()){
++      before_cluster_id.push_back(current_id_box.first);
++      continue;
++    }
++    for(auto& before_id : before_cluster_id){
++      if(is_overlap(current_id_box.second,id_box_map[before_id])){
++        overlap_area.push_back(calculate_overlap(current_id_box.second,id_box_map[before_id]));
++        all_overlap.push_back(std::make_pair(std::make_pair(current_id_box.first,before_id),overlap_area));
++      }
++    }
++    before_cluster_id.push_back(current_id_box.first);
++  }
++
++  // 重叠区域的处理，根据重叠区域的大小，调整cluster的shape
++  // 标准单元簇的shape不变，宏簇和混合簇的shape调整，遍历overlap中id.first就行
++
++  for(auto& overlap : all_overlap){
++    int current_id = overlap.first.first;
++    auto current = tree_->maps.id_to_cluster.find(current_id);
++    Cluster* current_cluster_ptr = current->second;
++    // 不调整标准单元簇
++    if(current_cluster_ptr->getClusterType() == StdCellCluster){
++      continue;
++    }
++    // 调整宏簇和混合簇
++    int before_id = overlap.first.second;
++    // auto before = tree_->maps.id_to_cluster.find(before_id);
++    // Cluster* before_cluster_ptr = before->second;
++
++    // 计算重叠区域面积
++    float current_area = id_shape_map_[current_id].first * id_shape_map_[current_id].second;
++    float before_area = id_shape_map_[before_id].first * id_shape_map_[before_id].second;
++    float overlap_area = overlap.second[0].first;
++    float current_overlap_ratio = overlap_area/current_area;
++    float before_overlap_ratio = overlap_area/before_area;
++
++    // 重叠区域占比大于0.5，调整shape
++    if(current_overlap_ratio>0.5){
++      float changed_width = id_shape_map_[current_id].first * sqrt(1/current_overlap_ratio);
++      float changed_height = id_shape_map_[current_id].second * sqrt(current_overlap_ratio);
++      id_shape_map_[current_id].first = changed_width;
++      id_shape_map_[current_id].second = changed_height;
++    }else if(before_overlap_ratio>0.5){
++      auto before = tree_->maps.id_to_cluster.find(before_id);
++      Cluster* before_cluster_ptr = before->second;
++
++      if(before_cluster_ptr->getClusterType() == StdCellCluster){
++        continue;
++      }
++      // 修改shape先修改tiling
++      id_shape_map_[before_id].first = id_shape_map_[current_id].first * sqrt(1/current_overlap_ratio);
++      id_shape_map_[before_id].second = id_shape_map_[current_id].second * sqrt(current_overlap_ratio);
++    }
++  }
++  // quadtrees::QuadTree<Rect> quadtree;
++
++}
++
++////////////////////////////////////////////////////////////////////////
++// Shape Generate
++////////////////////////////////////////////////////////////////////////
++void HierRTLMP::shapeGenerate(){
++  // std::unordered_map<int,std::pair<float,float>> id_shape_map;  // id-宽长比的map 
++  // std::random_device rd;
++  // std::mt19937 gen(rd());
++
++  const odb::Rect core_box = block_->getCoreArea();
++  const float core_width = block_->dbuToMicrons(core_box.xMax()) - block_->dbuToMicrons(core_box.xMin());
++  const float core_height = block_->dbuToMicrons(core_box.yMax()) - block_->dbuToMicrons(core_box.yMin());
++   
++  // for (auto& cluster : tree_->root.get()->getChildren()) {
++  //   if(cluster->isIOCluster() == true){
++  //     continue;
++  //   }
++  //   shape.first = core_width+1;
++  //   shape.second = core_height+1;
++  //   int id = cluster->getId();
++  //   if(cluster->getClusterType() == MixedCluster){
++  //     while(shape.first>core_width || shape.second>core_height){
++  //       // 从macro_tilings中随机挑选
++  //       std::pair<float, float> tiling_shape = setRandomShapes(*cluster);
++  //       // 加入标准单元面积
++  //       float std_area = cluster->getMetrics().getStdCellArea();
++  //       float mixed_area = std_area + tiling_shape.first * tiling_shape.second;
++  //       // 按文章来说， macro_tilings超过宽长比不会超过0.33-3的界限
++  //       // 计算当前tiling情况下可能的的宽长比范围
++  //       std::pair<float,float> width_range(tiling_shape.first,mixed_area/tiling_shape.first);
++  //       // std::pair<float,float> height_range(tiling_shape.second,mixed_area/tiling_shape.second);
++  //       std::pair<float,float> height_range(std::min(tiling_shape.second,mixed_area/tiling_shape.second),std::max(tiling_shape.second,mixed_area/tiling_shape.second));
++  //       // 宽长比的界限,ratio = width/height
++  //       float val1 = 0.33f, val2 = 3.0f;
++  //       // 最小宽长比：max(0.33,最小宽/最大高),最大宽长比：min(3,最大宽/最小高)
++  //       std::pair<float,float> ratio_range(std::max(val1,width_range.first/height_range.second),std::min(val2,width_range.second/height_range.first));
++  //       // 随机生成宽长比
++  //       std::uniform_real_distribution<float> dis(ratio_range.first, ratio_range.second);
++  //       float random_ratio = dis(gen);
++  //       // 宽/高=ratio
++  //       shape.first = sqrt(mixed_area*random_ratio);
++  //       shape.second = sqrt(mixed_area/random_ratio);
++  //       // std::pair<float,float> shape(sqrt(mixed_area*random_ratio),sqrt(mixed_area/random_ratio));
++  //     }
++  //     // id_shape_map.emplace(id,shape); 
++  //   } else if(cluster->getClusterType() == StdCellCluster) {
++  //     while(shape.first>core_width || shape.second>core_height){
++  //       // 宽长比随机生成0.33-3
++  //       float std_area = cluster->getMetrics().getStdCellArea();
++  //       std::uniform_real_distribution<float> dis(0.33f, 3.0f);
++  //       float random_ratio = dis(gen);
++  //       // 宽长比随机会导致replace有时候无法收敛，因此暂且全部标准单元簇设置为正方形，这样确保收敛
++  //       random_ratio = 1.0f;
++  //       // width = sqrt(area*ratio), height = sqrt(area/ratio)
++  //       shape.first = sqrt(std_area*random_ratio);
++  //       shape.second = sqrt(std_area/random_ratio);
++  //       // std::pair<float,float> shape(sqrt(std_area*random_ratio), sqrt(std_area/random_ratio));        
++  //     }
++  //     // id_shape_map.emplace(id,shape);
++  //   } else if(cluster->getClusterType() == HardMacroCluster) {
++  //     while(shape.first>core_width || shape.second>core_height){
++  //       std::pair<float, float> shape_temp = setRandomShapes(*cluster);
++  //       shape.first = shape_temp.first;
++  //       shape.second = shape_temp.second;
++  //     }
++  //     // id_shape_map.emplace(id,shape);
++  //   }
++  //   id_shape_map_.emplace(id,shape);
++  // }
++  
++  std::pair<float,float> shape;
++  for (auto& cluster : tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    int id = cluster->getId();
++    float area = 0.0f;
++    if(cluster->getClusterType() == MixedCluster){
++      area += cluster->getStdCellArea();
++      for(auto hardmacro : cluster->getHardMacros()){
++        area += hardmacro->getWidth() * hardmacro->getHeight();
++      }
++    } else if(cluster->getClusterType() == StdCellCluster){
++      area += cluster->getStdCellArea();
++    } else if(cluster->getClusterType() == HardMacroCluster) {
++      for(auto hardmacro : cluster->getHardMacros()){
++        area += hardmacro->getWidth() * hardmacro->getHeight();
++      }
++    }
++    const float core_aspect_ratio = core_height > 0.0f ? core_width / core_height : 1.0f;
++    shape.first = sqrt(area * core_aspect_ratio);
++    shape.second = sqrt(area / core_aspect_ratio);
++    id_shape_map_.emplace(id, shape);
++  }
++    
++  // 膨胀
++  float sum_area = 0.0;
++  for(auto entry : id_shape_map_){
++    sum_area += entry.second.first * entry.second.second;
++  }
++
++  const float core_area = core_width * core_height;
++  expand_ratio_ = sum_area > 0.0f ? core_area / sum_area : 1.0f;
++
++  for(auto& entry : id_shape_map_){
++    entry.second.first *= sqrt(expand_ratio_);
++    entry.second.second *= sqrt(expand_ratio_);
++  }
++
++  // 膨胀完后，若出现超级大的超出core_width或者core_height簇，需要调整
++  for(auto& entry : id_shape_map_){
++    if(entry.second.first>core_width || entry.second.second>core_height){
++      float entry_area = entry.second.first * entry.second.second;
++      if(entry.second.first>core_width){
++        entry.second.first = core_width-1;
++        entry.second.second = entry_area/core_width;
++      }else if (entry.second.second>core_height){
++        entry.second.second = core_height-1;
++        entry.second.first = entry_area/core_height;
++      }
++    }
++  }
++
++}
++
++
++std::pair<float, float> HierRTLMP::setRandomShapes(Cluster& cluster){
++  // 仅针对混合簇和宏簇的macro_tilings生成一个随机的宽高
++  const auto& macroTilings = cluster.getMacroTilings();
++  if (macroTilings.empty()) {
++        throw std::runtime_error("No macro tilings available for the cluster.");
++  }
++
++  std::random_device rd;
++  std::mt19937 gen(rd()); 
++  std::uniform_int_distribution<> dis(0, macroTilings.size()-1);
++  int random_number = dis(gen);
++
++  float tiling_width = cluster.getMacroTilings()[random_number].first;
++  float tiling_height = cluster.getMacroTilings()[random_number].second;
++  // std::pair<float, float> shape(tiling_width, tiling_height);
++  return std::make_pair(tiling_width, tiling_height);
++}
++
++////////////////////////////////////////////////////////////////////////
++// Write Cluster
++////////////////////////////////////////////////////////////////////////
++void HierRTLMP::WriteClusterResult(){
++  // std::string path = stage_path_;
++  bool current_io = true;
++
++  ioid_clusterid_vector_.clear();
++
++  for(auto& IOcluster:tree_->root->getChildren()){
++    if(!IOcluster->isIOCluster()){
++      continue;
++    }
++    for(auto& connect : IOcluster->getConnection()){
++      ioid_clusterid_vector_.push_back(std::make_pair(std::make_pair(IOcluster->getId(),connect.first),current_io));
++    }
++    current_io = !current_io;
++  }
++
++  WriteVerilog();  
++  WriteLib();
++  // WriteDef();
++  WriteLef();  
++
++  if(diverge_flag_ == false){
++    WriteDef();
++  }
++
++}
++
++void HierRTLMP::WriteVerilog(){
++  std::string path = stage_path_;
++  std::string line;
++  std::string verilog_name = "/root_cluster_"+block_->getName()+".v";
++  std::string verilog_path = path + verilog_name;
++  std::ofstream write_verilog(verilog_path);
++  if(!write_verilog.is_open()){
++    std::cerr<<"cannot create file: "<<verilog_path<<std::endl;
++    logger_->error(MPL, 1006, "cannot create verilog file");
++  }
++  // 模块头
++  write_verilog<<"module root_cluster (\n";
++  int pin_index = 0;
++  for(auto& pin_connect : ioid_clusterid_vector_){
++
++    if(pin_connect.second){  //true的话，这是INPUT PIN
++      write_verilog<<"inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++    }else{
++      write_verilog<<"outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++    }
++
++    pin_index++;
++    if(pin_index != ioid_clusterid_vector_.size()){
++      write_verilog<<",\n";
++    }else{
++      write_verilog<<"\n";
++    }
++  }
++
++  // 👌
++  write_verilog<<");\n";
++  // cluster_pin_num_map用来存储每个簇有几个连接,从而确定每个簇的端口数
++  std::map<int,int> cluster_pin_num_map;
++  // all_nets是存储所有顶层簇之间的连接
++  // A set to store all the nets between top-level clusters.
++  // The PairComparator ensures that the pairs are stored in a specific order.
++  std::set<std::pair<int, int>, PairComparator> all_nets;
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    int connected_num = 0;
++    for (const auto& pair : cluster->getConnection()) {
++      auto it = tree_->maps.id_to_cluster.find(pair.first);
++      if (it == tree_->maps.id_to_cluster.end()) {
++        continue;
++        // logger_->error(MPL, 1009, "Cannot find cluster in id_to_cluster map {}",pair.first);
++      }  // 找不到这个连接对应的cluster，这里就不报错，直接跳过
++      
++      Cluster* clusterPtr = it->second; // 获取 Cluster 指针
++      if(clusterPtr->isIOCluster() == false){
++        if(clusterPtr->getParent() == tree_->root.get()){
++          connected_num++;
++          all_nets.emplace(cluster->getId(),pair.first);
++        }
++      }
++      // if(tree_->maps.id_to_cluster[pair.first]->isIOCluster() == false){  //这个连接不是与IO，且是顶层
++      //   if(tree_->maps.id_to_cluster[pair.first]->getParent() == tree_->root.get()){
++      //     connected_num++;
++      //     all_nets.emplace(cluster->getId(),pair.first);
++      //   }
++      // }
++    }
++    cluster_pin_num_map.emplace(cluster->getId(),connected_num);
++  }
++  // 写线网
++  for(int net_ordered = 1;net_ordered<all_nets.size()+1;net_ordered++){
++    line = "wire   w"+std::to_string(net_ordered)+';';
++    write_verilog<<line<<std::endl;
++  }
++  // 写pin相关的线网
++  for (auto& pin_connect : ioid_clusterid_vector_){
++    if(pin_connect.second){  //true的话，这是INPUT PIN
++      line = "input inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+";";
++    }else{
++      line = "output outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+";";
++    }
++    write_verilog<<line<<std::endl;
++  }
++
++
++  // 写连接关系
++  // 写一个map,ID-vector,这个vector里就是依次的线网
++  // 遍历all_nets,找到每个2 pin-nets对应的两个map,在这俩映射的vector后push_back
++  std::map<int,std::vector<int>> cluster_wire_map;
++  int wire_order = 1;
++  for(auto net : all_nets){
++    // 判断当前cluster_wire_map中是否有net对应的map中的那个数组
++    // 没有就开一个ID-vector
++    if(cluster_wire_map.find(net.first) == cluster_wire_map.end()){
++      std::vector<int> temp_vector1;
++      cluster_wire_map[net.first] = temp_vector1;
++    }
++    if(cluster_wire_map.find(net.second) == cluster_wire_map.end()){
++      std::vector<int> temp_vector2;
++      cluster_wire_map[net.second] = temp_vector2;
++    }
++
++    cluster_wire_map[net.first].push_back(wire_order);
++    cluster_wire_map[net.second].push_back(wire_order);
++    wire_order++;
++  }
++
++  // 写cluster-wire
++  int write_order = 1;
++  std::string str = std::to_string(write_order);
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    // 类型是cluster的name_
++    std::string type = "fake_macro" + std::to_string(write_order);
++    // std::string type = cluster->getName();
++    // 名称是U+顺序
++    // std::string name = 'U'+std::to_string(write_order);
++    // 名称修改成U+ID
++    std::string name = 'U'+std::to_string(cluster->getId());
++
++    // pin数量
++    int pin_num = cluster_wire_map[cluster->getId()].size();
++    // int pin_num = cluster_pin_num_map[cluster->getId()];
++    line = "  "+type+' '+name+" ( ";
++
++    // 先加与IO连接的
++    for(auto& pin_connect : ioid_clusterid_vector_){
++      if(pin_connect.first.second == cluster->getId()){
++        if(pin_connect.second){  //pin是input,那这个单元连接的也是input，命名为I_pin+连接的簇id
++          std::string wire = "inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++          line = line+" .I_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+"("+wire+"),";
++        }else{
++          std::string wire = "outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++          line = line+" .O_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+"("+wire+"),";
++        }
++      }
++    }
++
++    for(int i=0;i<pin_num;i++){
++      // 找此时的线网
++      int wire = cluster_wire_map[cluster->getId()][i];
++      if((i+1)%2==1){
++        if(i<pin_num-1){
++          line = line + " .I"+std::to_string((i+2)/2)+"(w"+std::to_string(wire)+"),";
++        }else{
++          line = line + " .I"+std::to_string((i+2)/2)+"(w"+std::to_string(wire)+")";
++        }
++      // line = line + " .I"+std::to_string((i+2)/2)+"(w"+std::to_string(wire)+"),";
++      }else{
++        if(i<pin_num-1){
++          line = line + " .O"+std::to_string((i+1)/2)+"(w"+std::to_string(wire)+"),";
++        }else{
++          line = line + " .O"+std::to_string((i+1)/2)+"(w"+std::to_string(wire)+")";
++        }
++      // line = line + " .O"+std::to_string((i+1)/2)+"(w"+std::to_string(wire)+"),";
++      }
++    }
++
++    line = line + " ) ;";
++    write_verilog<<line<<std::endl;
++    write_order++;
++  }
++
++  line = "endmodule";
++  write_verilog<<line<<std::endl;
++  write_verilog.close();
++}
++
++void HierRTLMP::WriteDef(){
++  std::string path = stage_path_;
++  // 写def
++  // 创建新def文件
++  std::string case_name = block_->getName();
++
++  std::string def_name = "/root_cluster_"+block_->getName()+".def";
++  std::string def_path = path + def_name;
++  std::string origin_def_path;
++  
++  // 依据不同例子效仿对应的def文件
++  if(case_name == "bp_fe_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/bp_fe/base/2_2_floorplan_io.def";
++  }else if(case_name == "black_parrot"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/bp/base/2_2_floorplan_io.def";
++  }else if(case_name == "superblue18"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue18/pin-placed.def";
++  }else if(case_name == "ariane"){
++    origin_def_path = "/workspace/ariane133/ariane133_fp.def";
++  }else if(case_name == "swerv_wrapper"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/swerv_wrapper43/base/2_3_floorplan_macro.def";
++    // origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/swerv_wrapper/base/2_3_floorplan_macro.def";
++  }else if(case_name == "bp_be_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/bp_be/base/2_3_floorplan_macro.def";
++  }else if (case_name == "bp_multi_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/bp_multi/base/2_3_floorplan_macro.def";
++  }else if (case_name == "npu_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/isa_npu/base/2_3_floorplan_macro.def"; 
++  }else if (case_name == "dft_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/dft68/base/2_3_floorplan_macro.def"; 
++  }else if (case_name == "superblue1"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue1/pin-placed.def";
++  }else if (case_name == "superblue3"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue3/pin-placed.def";
++  }else if (case_name == "superblue4"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue4/pin-placed.def";
++  }else if (case_name == "superblue5"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue5/pin-placed.def";
++  }else if (case_name == "superblue7"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue7/pin-placed.def";
++  }else if (case_name == "superblue10"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue10/pin-placed.def";
++  }else if (case_name == "superblue16"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue16/pin-placed.def";
++  }else if (case_name == "superblue18"){
++    origin_def_path = "/workspace/iccad2015.ot/sp-result-mpl2/superblue18/pin-placed.def";
++  }else if (case_name == "mor1kx"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/mor1kx/base/2_3_floorplan_macro.def";
++  }else if (case_name == "or1200_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/or1200/base/2_3_floorplan_macro.def";
++  }else if (case_name == "eth_top"){
++    origin_def_path = "/workspace/OpenROAD-flow-scripts/flow/results/nangate45/ethernet/base/2_3_floorplan_macro.def";
++  }else{
++    std::cerr<<"cannot find the origin def file"<<std::endl;
++    logger_->error(MPL, 1002, "cannot find the origin def file");
++  }
++  // 打开原始def进行读取,这里先以bp_fe为例子，debug时找不到把例子名称放哪了
++  // COMPONENTS前照着bp_fe/2_2_floorplan_io.def写
++  // Archive/reproduction Tcl files can provide the exact benchmark floorplan DEF.
++  // This keeps the top-level root placement setup tied to the active design
++  // instead of relying on stale absolute development paths.
++  if (const char* env_origin_def = std::getenv("MPL2_ORIGIN_DEF_PATH")) {
++    if (std::strlen(env_origin_def) > 0) {
++      origin_def_path = env_origin_def;
++    }
++  }
++
++  std::ifstream origin_def(origin_def_path);
++  if(!origin_def.is_open()){
++    std::cerr<<" cannot open file: "<<origin_def_path<<std::endl;
++  }
++
++  std::ofstream write_def(def_path);
++  if(!write_def.is_open()){
++    std::cerr<<"cannot create file: "<<def_path<<std::endl;
++    logger_->error(MPL, 1007, "cannot create file");
++  }
++
++  std::string line;
++  while(std::getline(origin_def,line)){
++    if(line.rfind("COMPONENTS",0) == 0){
++      break;
++    }
++    write_def<<line<<std::endl;
++  }
++  origin_def.close();
++
++  // COMONENTS部分,这个重载是bloat的，直接不写
++  // line = "COMPONENTS "+std::to_string(id_shape_map.size())+" ;";
++  // write_def<<line<<std::endl;
++  // // pin之后的部分
++  // int write_order = 1;
++  // for(auto& cluster : tree_->root->getChildren()){
++  //   if(cluster->isIOCluster() == true){
++  //     continue;
++  //   }
++  //   // int id_cluster = cluster->getId();
++  //   line = "    - "+std::string(1, 'U')+std::to_string(write_order)+" "+"fake_macro"+std::to_string(write_order)+" ;";
++  //   write_order++;
++  //   write_def<<line<<std::endl;
++  // }
++  // write_def<<"END COMPONENTS"<<std::endl; 
++
++  // 写PINS
++  write_def<<"PINS "<<std::to_string(ioid_clusterid_vector_.size())<<" ;"<<std::endl;
++
++  for(auto& pin_connect:ioid_clusterid_vector_){
++    // 找id和位置
++    auto it = tree_->maps.id_to_cluster.find(pin_connect.first.first);
++    if(it == tree_->maps.id_to_cluster.end()){
++      continue;
++    }
++    Cluster* clusterPtr = it->second;
++    float x = clusterPtr->getSoftMacro()->getX();
++    float y = clusterPtr->getSoftMacro()->getY();
++    float width = clusterPtr->getSoftMacro()->getWidth();
++    float height = clusterPtr->getSoftMacro()->getHeight();
++    int x_pin = 0;
++    int y_pin = 0;
++    const int pin_offset = block_->micronsToDbu(0.07);
++
++    if(height==0){
++      if(y>1){  // 👆pin
++        x_pin = block_->micronsToDbu(x + width / 2);
++        y_pin = block_->micronsToDbu(y + height) - pin_offset;
++      }else{  // 👇pin
++        x_pin = block_->micronsToDbu(x + width / 2);
++        y_pin = block_->micronsToDbu(y) + pin_offset;        
++      }
++    }else if(width==0){
++      if(x>1){  // 👉pin
++        x_pin = block_->micronsToDbu(x + width) - pin_offset;
++        y_pin = block_->micronsToDbu(y + height / 2);
++      }else{  // 👈pin
++        x_pin = block_->micronsToDbu(x) + pin_offset;
++        y_pin = block_->micronsToDbu(y + height / 2);
++      }
++    }
++    if(pin_connect.second){  //true的话，这是INPUT PIN
++      line = "    - inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++                  " + NET inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+" + DIRECTION INPUT + USE SIGNAL\n"
++             "      + PORT\n"
++             "        + LAYER metal6 ( -140 -140 ) ( 140 140 )\n"
++             "        + PLACED ( "+std::to_string(x_pin)+" "+std::to_string(y_pin)+" ) N ;";
++    }else{
++      line = "    - outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++                  " + NET outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+" + DIRECTION OUTPUT + USE SIGNAL\n"
++             "      + PORT\n"
++             "        + LAYER metal6 ( -140 -140 ) ( 140 140 )\n"
++             "        + PLACED ( "+std::to_string(x_pin)+" "+std::to_string(y_pin)+" ) N ;";
++    }
++    write_def<<line<<std::endl;
++  }
++
++  write_def<<"END PINS"<<std::endl;
++
++
++  // 写Net，比较困难，直接写verilog让openroad生成
++  write_def<<"END DESIGN"<<std::endl;
++
++}
++
++void HierRTLMP::WriteLef(){
++  std::string path = stage_path_;
++  // 写lef，仿照macro_only.lef写
++  std::string lef_name = "/root_cluster_"+block_->getName()+".lef";
++  std::string lef_path = path + lef_name;
++
++  std::string start = "VERSION 5.6 ;\n"
++                      "BUSBITCHARS \"[]\" ;\n"
++                      "DIVIDERCHAR \"/\" ;\n";
++  
++  // PIN,这里要修改,不是简单的每个簇一个input一个output
++  // 连接关系不对,不能简单的认为只有一个输入输出,要数连接,根据IO_cluster判断这个连接是input还是output
++  // 所有线网都是二端线网
++
++  // 由于金属层的不清楚，所以I1-I4和O1-O4和HM_100x400_4x4的一样，多的就再从1开始
++  // 用来存储每个簇有几个连接,从而确定每个簇的IO数,写PIN
++  // 和WriteVerilog一样设计的pin数目
++  std::set<std::pair<int, int>, PairComparator> all_nets;
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    for (const auto& pair : cluster->getConnection()) {
++      auto it = tree_->maps.id_to_cluster.find(pair.first);
++      if (it == tree_->maps.id_to_cluster.end()) {
++        continue;
++      } 
++      Cluster* clusterPtr = it->second; // 获取 Cluster 指针
++      if(clusterPtr->isIOCluster() == false){
++        if(clusterPtr->getParent() == tree_->root.get()){
++          all_nets.emplace(cluster->getId(),pair.first);
++        }
++      }
++    }
++  }
++
++  std::map<int,std::vector<int>> cluster_wire_map;
++  int wire_order = 1;
++  for(auto net : all_nets){
++    if(cluster_wire_map.find(net.first) == cluster_wire_map.end()){
++      std::vector<int> temp_vector1;
++      cluster_wire_map[net.first] = temp_vector1;
++    }
++    if(cluster_wire_map.find(net.second) == cluster_wire_map.end()){
++      std::vector<int> temp_vector2;
++      cluster_wire_map[net.second] = temp_vector2;
++    }
++    cluster_wire_map[net.first].push_back(wire_order);
++    cluster_wire_map[net.second].push_back(wire_order);
++    wire_order++;
++  }
++
++  std::ofstream write_lef(lef_path);
++  if(!write_lef.is_open()){
++    std::cerr<<"cannot create file: "<<lef_path<<std::endl;
++    logger_->error(MPL, 1008, "cannot create lef file");
++  }
++  write_lef<<start<<std::endl;
++
++  std::string line;
++  int write_order = 1;
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    line = "MACRO fake_macro"+std::to_string(write_order);
++    write_lef<<line<<std::endl;
++    write_lef<<"  CLASS BLOCK ;"<<std::endl;
++    line = "  FOREIGN fake_macro"+std::to_string(write_order)+" 0 0 ;";
++    write_lef<<line<<std::endl;
++    line = "  ORIGIN 0 0 ;\n"
++           "  SYMMETRY X Y ;";
++    write_lef<<line<<std::endl;
++    std::pair<float,float> shape = id_shape_map_[cluster->getId()];
++    line = "  SIZE "+std::to_string(std::floor(shape.first))+" BY "+std::to_string(std::floor(shape.second))+" ;";
++    write_lef<<line<<std::endl;
++
++    // 写pin
++    int num_pin = cluster_wire_map[cluster->getId()].size();
++    // 与IO连接的pin
++    for(auto& pin_connect : ioid_clusterid_vector_){
++      if(pin_connect.first.second == cluster->getId()){
++        if(pin_connect.second){  //pin是input,那这个单元连接的也是input，命名为I_pin+连接的簇id
++          line = "  PIN I_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++          "\n    DIRECTION INPUT ;"
++          "\n    PORT"
++          "\n      LAYER metal3 ;"
++          "\n        RECT 0 210 0.140 210.070  ;"
++          "\n    END"
++          "\n  END I_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++        }else{
++          line = "  PIN O_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++          "\n    DIRECTION OUTPUT ;"
++          "\n    PORT"
++          "\n      LAYER metal3 ;"
++          "\n        RECT 99.860 210 100 210.070  ;"
++          "\n    END"
++          "\n  END O_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second);
++        }
++        write_lef<<line<<std::endl;
++      }
++    }
++
++
++
++    for(int i=1;i<num_pin+1;i++){
++      if(i%2 == 1){
++        line = "  PIN I"+std::to_string((i+1)/2)+
++               "\n    DIRECTION INPUT ;"
++               "\n    PORT"
++               "\n      LAYER metal3 ;"
++               "\n        RECT 0 210 0.140 210.070  ;"
++               "\n    END"
++               "\n  END I"+std::to_string((i+1)/2);
++      }else{
++        line = "  PIN O"+std::to_string(i/2)+
++               "\n    DIRECTION OUTPUT ;"
++               "\n    PORT"
++               "\n      LAYER metal3 ;"
++               "\n        RECT 99.860 210 100 210.070  ;"
++               "\n    END"
++               "\n  END O"+std::to_string(i/2);
++      }
++      write_lef<<line<<std::endl;
++    }
++    // write_lef<<pin<<std::endl;
++    line = "  OBS\n"
++           "      LAYER metal3 ;\n"
++           "        RECT 0 0 100 100 ;\n"
++           "  END\n";
++    write_lef<<line;
++    line = "END fake_macro"+std::to_string(write_order)+"\n";
++    write_order++;
++    write_lef<<line<<std::endl;
++  }
++
++  write_lef.close();
++  // 后面macro_only.lef中DoubleHeightSite及后续的部分暂时不写
++}
++
++void HierRTLMP::WriteLib(){
++  std::string path = stage_path_;
++  // 写lib,前面和macro_only一样，这是另外的lib和lef，之前tcl里要写读Nangate45.lef
++  std::string lib_name = "/root_cluster_"+block_->getName()+".lib";
++  std::string lib_path = path + lib_name;
++  std::string origin_lib_path = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/test/testcases/macro_only.lib";
++  std::ifstream origin_lib(origin_lib_path);
++  if(!origin_lib.is_open()){
++    std::cerr<<" cannot open file: "<<origin_lib_path<<std::endl;
++    logger_->error(MPL, 1004, "cannot open lib file");
++  }
++  std::ofstream write_lib(lib_path);
++  if(!write_lib.is_open()){
++    std::cerr<<" cannot open file: "<<lib_path<<std::endl;
++    logger_->error(MPL, 1005, "cannot open lib file");
++  }
++  std::string line;
++
++  // cell前和macro_only.lib一样
++  while(std::getline(origin_lib,line)){ 
++    if(line.compare(0, 8, "    cell") == 0){
++      break;
++    }
++    write_lib<<line<<std::endl;
++  }
++  origin_lib.close();
++  // cell部分
++  // 和WriteVerilog一样设计的pin数目
++  std::set<std::pair<int, int>, PairComparator> all_nets;
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    for (const auto& pair : cluster->getConnection()) {
++      auto it = tree_->maps.id_to_cluster.find(pair.first);
++      if (it == tree_->maps.id_to_cluster.end()) {
++        continue;
++      } 
++      Cluster* clusterPtr = it->second; // 获取 Cluster 指针
++      if(clusterPtr->isIOCluster() == false){
++        if(clusterPtr->getParent() == tree_->root.get()){
++          all_nets.emplace(cluster->getId(),pair.first);
++        }
++      }
++    }
++  }
++
++  std::map<int,std::vector<int>> cluster_wire_map;
++  int wire_order = 1;
++  for(auto net : all_nets){
++    if(cluster_wire_map.find(net.first) == cluster_wire_map.end()){
++      std::vector<int> temp_vector1;
++      cluster_wire_map[net.first] = temp_vector1;
++    }
++    if(cluster_wire_map.find(net.second) == cluster_wire_map.end()){
++      std::vector<int> temp_vector2;
++      cluster_wire_map[net.second] = temp_vector2;
++    }
++    cluster_wire_map[net.first].push_back(wire_order);
++    cluster_wire_map[net.second].push_back(wire_order);
++    wire_order++;
++  }
++
++  int write_order = 1;
++  // 写cell
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    line = "    cell(fake_macro"+std::to_string(write_order)+") {";
++    write_order++;
++    write_lib<<line<<std::endl;
++    int area = std::floor(std::floor(id_shape_map_[cluster->getId()].first) * std::floor(id_shape_map_[cluster->getId()].second));
++    line = "        area : "+std::to_string(area)+";";
++    write_lib<<line<<std::endl;
++    write_lib<<"        interface_timing : true;\n"
++               "        is_macro : true;\n\n";
++    int pin_num = cluster_wire_map[cluster->getId()].size();
++
++    // 与IO连接的pin
++    for(auto& pin_connect : ioid_clusterid_vector_){
++      if(pin_connect.first.second == cluster->getId()){
++        if(pin_connect.second){  //pin是input,那这个单元连接的也是input，命名为I_pin+连接的簇id
++          line = "    pin (I_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+") {";
++          write_lib<<line<<std::endl;
++          write_lib<<"        direction : input;\n"
++                   "    }\n";
++        }else{
++          line = "    pin (O_pin_"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+") {";
++          write_lib<<line<<std::endl;
++          write_lib<<"        direction : output;\n"
++                   "    }\n";
++        }
++      }
++    }
+ 
+-#include "Mpl2Observer.h"
+-#include "SACoreHardMacro.h"
+-#include "SACoreSoftMacro.h"
+-#include "bus_synthesis.h"
+-#include "db_sta/dbNetwork.hh"
+-#include "object.h"
+-#include "odb/db.h"
+-#include "odb/util.h"
+-#include "par/PartitionMgr.h"
+-#include "sta/Liberty.hh"
+-#include "utl/Logger.h"
++    for(int i=1;i<pin_num +1;i++){
++      if(i%2==1){
++        line = "    pin (I"+std::to_string((i+1)/2)+") {\n"
++               "        direction : input;\n"
++               "    }";
++      }else{
++        line = "    pin (O"+std::to_string(i/2)+") {\n"
++               "        direction : output;\n"
++               "    }";
++      }
++      write_lib<<line<<std::endl;
++    }
++    write_lib<<"    }\n"<<std::endl;
++  }
++  write_lib<<"}\n";
++  write_lib.close();
++}
+ 
+-namespace mpl2 {
++////////////////////////////////////////////////////////////////////////
++// run Replace
++////////////////////////////////////////////////////////////////////////
++void HierRTLMP::runReplaceTcl(){
++  std::string path = stage_path_;
+ 
+-using std::string;
++  // 计算要扩散的宏簇数
++  int num = 0;
++  for(auto& cluster : tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    num++;
++  }
++
++  // 写tcl文件
++  std::string tcl_name = "root_"+block_->getName()+".tcl";
++  std::string write_tcl_path = path + "/"+tcl_name;
++  std::ofstream write_tcl(write_tcl_path);
++  if(!write_tcl.is_open()){
++    std::cerr<<"cannot create file: "<<write_tcl_path<<std::endl;
++    logger_->error(MPL, 1001, "cannot create tcl file");
++  }
++  std::string line;
++  if(block_->getName() == "superblue4"){
++    write_tcl<<"read_lib /workspace/iccad2015.ot/superblue4/superblue4_Late.lib"<<std::endl;
++    write_tcl<<"read_lef /workspace/iccad2015.ot/superblue4/superblue4.lef"<<std::endl;
++  }else{
++    write_tcl<<"read_lef /workspace/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.tech.lef"<<std::endl;
++  }
++  // write_tcl<<"read_lef /workspace/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.tech.lef"<<std::endl;
++  write_tcl<<"read_lef "+stage_path_+"/root_cluster_"+block_->getName()+".lef"<<std::endl;
++  write_tcl<<"read_lib "+stage_path_+"/root_cluster_"+block_->getName()+".lib"<<std::endl;
++  write_tcl<<"read_verilog "+stage_path_+"/root_cluster_"+block_->getName()+".v"<<std::endl;
++  write_tcl<<"link_design \"root_cluster\""<<std::endl;
++  write_tcl<<"read_def "+stage_path_+"/root_cluster_"+block_->getName()+".def -floorplan_initialize"<<std::endl;
++  
++  // if(num<5){
++  //   write_tcl << "catch {global_placement -density 0.9 -init_wirelength_coef 0.05 -bin_grid_count 64 -overflow 0.1} errMsg" << std::endl;
++  // }else{
++  //   write_tcl << "catch {global_placement -density 0.9 -init_wirelength_coef 0.05 -bin_grid_count 64 -overflow 0.2} errMsg" << std::endl;
++  // }
++
++  // 使用 catch 捕获错误
++  write_tcl << "catch {global_placement -density 0.9 -init_wirelength_coef 0.05 -bin_grid_count 64 -overflow 0.2} errMsg" << std::endl;
++  write_tcl << "if { [string length $errMsg] > 0 } { puts \"WARNING: root_cluster placement failed with error: $errMsg\" } else { puts \"INFO: root_cluster placement executed successfully\" }" << std::endl;
++
++  // 确保 write_def 被执行
++  write_tcl << "write_def " + block_->getName() + "_root_placed.def" << std::endl;
++  write_tcl << "exit" << std::endl;
++
++  write_tcl.close();
++
++  // 改变工作目录
++  if (chdir(path.c_str()) != 0) {
++      perror("chdir failed");
++      return;
++  }
++  // std::string tcl_path = "root_"+block_->getName()+".tcl";
++  std::string command = "../openroad "+tcl_name;
+ 
+-static string make_filename(const string& file_name)
+-{
+-  return std::regex_replace(file_name, std::regex("[\":<>\\|\\*\\?/]"), "--");
++  // 用popen读取RePlace的输出
++  FILE* pipe = popen(command.c_str(),"r");
++  if(!pipe){
++    std::cerr<<"Failed to execute RePlace" << std::endl;
++    return;
++  }
++
++  char buffer[256];
++  while(fgets(buffer,sizeof(buffer),pipe)!=nullptr){
++    std::cout<<buffer;
++    if(strstr(buffer,"GPL-0305")!=nullptr){
++      diverge_flag_ = true;  // 如果发现 GPL-0305 错误，设置 flag
++    }else{
++      diverge_flag_ = false;
++    }
++  }
++  const int replace_status = pclose(pipe);
++  if (replace_status != 0) {
++    logger_->warn(MPL, 1021, "RePlace command '{}' exited with status {}.", command, replace_status);
++  }
++
++  // 先进行测试，无论收不收敛，都shrink
++  // shrinkReplace();
++
++  // 如果出现无法收敛，就shrink,再replace
++  if(diverge_flag_ == true){
++    shrinkReplace();
++  }
++
++  // std::cout<<"diverge_flag_ is "<<diverge_flag_<<std::endl;
++  // 如果flag是true，修改id_shape_map_和stage_path_,shrink后再进行replace
+ }
+ 
+-///////////////////////////////////////////////////////////
+-// Class HierRTLMP
+-using utl::MPL;
++void HierRTLMP::shrinkReplace(){
++  // 读取bloat的def文件
++  std::string path = stage_path_;
++  std::string def_path = path+"/"+block_->getName()+"_root_placed.def";
++  std::ifstream def_file(def_path);
++  if(!def_file.is_open()){
++    std::cerr<<"cannot open def file:"<<def_path<<std::endl;
++  }
++
++  // lambda表达式来拆分字符串
++  auto splitString = [](const std::string& input) {
++    std::istringstream stream(input);
++    std::vector<std::string> tokens;
++    std::string token;
++    // 逐个提取
++    while (stream >> token) {
++      tokens.push_back(token); // 将每个非空格的单词添加到数组中
++    }
++    return tokens; // 返回包含所有单词的数组
++  };
+ 
+-HierRTLMP::~HierRTLMP() = default;
++  std::unordered_map<int,std::pair<float,float>> shrink_loc_map;
+ 
+-// Constructors
+-HierRTLMP::HierRTLMP(sta::dbNetwork* network,
+-                     odb::dbDatabase* db,
+-                     utl::Logger* logger,
+-                     par::PartitionMgr* tritonpart)
+-    : network_(network),
+-      db_(db),
+-      logger_(logger),
+-      tritonpart_(tritonpart),
+-      tree_(std::make_unique<PhysicalHierarchy>())
++  std::string line;
++  bool COMPONENT_flag = false;
++  while(std::getline(def_file,line)){
++    if(line.substr(0, 10) == "COMPONENTS"){
++      COMPONENT_flag = true;
++      continue;
++    }
++    if(line.substr(0, 14) == "END COMPONENTS"){
++      COMPONENT_flag = false;
++      break;
++    }
++    // 使用 Lambda 表达式拆分字符串
++    if(COMPONENT_flag == true){
++      std::vector<std::string> tokens = splitString(line);
++      std::string num_str = tokens[1].substr(1);
++      int id = std::stoi(num_str);
++      shrink_loc_map[id] = std::make_pair(block_->dbuToMicrons(std::stoi(tokens[6])),block_->dbuToMicrons(std::stoi(tokens[7])));
++    }
++  }
++
++  // 计算shrink后的坐标，中心位置不变
++  for(auto& entry : shrink_loc_map){
++    float shrink_width = id_shape_map_[entry.first].first/expand_ratio_;
++    float shrink_height = id_shape_map_[entry.first].second/expand_ratio_;
++
++    entry.second.first = entry.second.first + id_shape_map_[entry.first].first/2 - shrink_width/2;
++    entry.second.second = entry.second.second + id_shape_map_[entry.first].second/2 - shrink_height/2;
++  }
++
++  // 写shrink的root_cluster的一系列文件，改id_shape_map_是为了写lef和lib,reback时恢复
++  for(auto& entry : id_shape_map_){
++    entry.second.first = entry.second.first/expand_ratio_;
++    entry.second.second = entry.second.second/expand_ratio_;
++  }
++
++  stage_path_ = "/workspace/OpenROAD-flow-scripts/tools/OpenROAD/src/mpl2/temp/shrink";
++  WriteClusterResult();
++  WriteDef(shrink_loc_map);
++  // 调用Replace得到结果
++  path = stage_path_;
++
++  // 写tcl文件
++  std::string tcl_name = "root_"+block_->getName()+".tcl";
++  std::string write_tcl_path = path + "/"+tcl_name;
++  std::ofstream write_tcl(write_tcl_path);
++  if(!write_tcl.is_open()){
++    std::cerr<<"cannot create file: "<<write_tcl_path<<std::endl;
++    logger_->error(MPL, 1010, "cannot create tcl file");
++  }
++
++  write_tcl<<"read_lef /workspace/OpenROAD-flow-scripts/flow/platforms/nangate45/lef/NangateOpenCellLibrary.tech.lef"<<std::endl;
++  write_tcl<<"read_lef "+stage_path_+"/root_cluster_"+block_->getName()+".lef"<<std::endl;
++  write_tcl<<"read_lib "+stage_path_+"/root_cluster_"+block_->getName()+".lib"<<std::endl;
++  write_tcl<<"read_verilog "+stage_path_+"/root_cluster_"+block_->getName()+".v"<<std::endl;
++  write_tcl<<"link_design \"root_cluster\""<<std::endl;
++  write_tcl<<"read_def "+stage_path_+"/root_cluster_"+block_->getName()+".def -floorplan_initialize"<<std::endl;
++
++  // 使用 catch 捕获错误
++  write_tcl << "catch {global_placement -incremental -density 0.6 -init_wirelength_coef 0.05 -overflow 0.2} errMsg" << std::endl;
++  write_tcl << "if { [string length $errMsg] > 0 } { puts \"WARNING: shrink root_cluster_placed failed with error: $errMsg\" } else { puts \"INFO: shrink root_cluster_placed executed successfully\" }" << std::endl;
++  write_tcl << "write_def " + block_->getName() + "_root_placed.def" << std::endl;
++  write_tcl << "exit" << std::endl;
++
++  write_tcl.close();
++
++  // 改变工作目录
++  if (chdir(path.c_str()) != 0) {
++      perror("chdir failed");
++      return;
++  }
++  std::string command = "../openroad "+tcl_name;
++
++  // 用popen读取RePlace的输出
++  FILE* pipe = popen(command.c_str(),"r");
++  if(!pipe){
++    std::cerr<<"Failed to execute RePlace" << std::endl;
++    return;
++  }
++
++  char buffer[256];
++
++  while(fgets(buffer,sizeof(buffer),pipe)!=nullptr){
++    std::cout<<buffer;
++  }
++  const int replace_status = pclose(pipe);
++  if (replace_status != 0) {
++    logger_->warn(MPL, 1022, "Shrink RePlace command '{}' exited with status {}.", command, replace_status);
++  }
++  
++  std::cout<<"shrink Replace finished"<<std::endl;
++
++}
++
++void HierRTLMP::WriteDef(std::unordered_map<int,std::pair<float,float>> shrink_loc_map){
++  std::string path = stage_path_;
++  std::string case_name = block_->getName();
++
++  std::string def_name = "/root_cluster_"+block_->getName()+".def";
++  std::string def_path = path + def_name;
++
++  // origin_def看bloat的结果
++  std::string target = "shrink";
++  std::string replacement = "bloat";
++  std::string origin_def_path = stage_path_;
++  size_t pos = origin_def_path.find(target);
++  origin_def_path.replace(pos,target.length(),replacement);
++  origin_def_path = origin_def_path+"/"+block_->getName()+"_root_placed.def";
++  
++  // lambda表达式来拆分字符串
++  auto splitString = [](const std::string& input) {
++    std::istringstream stream(input);
++    std::vector<std::string> tokens;
++    std::string token;
++    // 逐个提取
++    while (stream >> token) {
++      tokens.push_back(token); // 将每个非空格的单词添加到数组中
++    }
++    return tokens; // 返回包含所有单词的数组
++  };
++
++  // 按照bloat的def来写
++  std::ifstream origin_def(origin_def_path);
++  if(!origin_def.is_open()){
++    std::cerr<<" cannot open file: "<<origin_def_path<<std::endl;
++    // logger_->error(MPL, 1003, "cannot open def file");
++  }
++
++  std::ofstream write_def(def_path);
++  if(!write_def.is_open()){
++    std::cerr<<"cannot create file: "<<def_path<<std::endl;
++    logger_->error(MPL, 1011, "cannot create file");
++  }
++
++  // COMONENTS部分
++  std::string line;
++  bool components_flag = false;
++  while(std::getline(origin_def,line)){
++    if(line.rfind("COMPONENTS",0) == 0){
++      components_flag = true;
++      write_def<<line<<std::endl;
++      continue;
++    }
++    if(line.rfind("END COMPONENTS",0) == 0){
++      write_def<<line<<std::endl;
++      break;
++    }
++
++    if(components_flag == true){
++      std::vector<std::string> tokens = splitString(line);
++      std::string num_str = tokens[1].substr(1);
++      int id = std::stoi(num_str);
++      float new_x = shrink_loc_map[id].first;
++      float new_y = shrink_loc_map[id].second;
++
++      tokens[6] = std::to_string(block_->micronsToDbu(new_x));
++      tokens[7] = std::to_string(block_->micronsToDbu(new_y));
++
++      line = "    ";
++
++      for(auto token : tokens){
++        line = line + token + " ";
++      }
++    }
++
++    write_def<<line<<std::endl;
++  }
++  origin_def.close();
++
++  // 写PINS
++  write_def<<"PINS "<<std::to_string(ioid_clusterid_vector_.size())<<" ;"<<std::endl;
++
++  for(auto& pin_connect:ioid_clusterid_vector_){
++    // 找id和位置
++    auto it = tree_->maps.id_to_cluster.find(pin_connect.first.first);
++    if(it == tree_->maps.id_to_cluster.end()){
++      continue;
++    }
++    Cluster* clusterPtr = it->second;
++    float x = clusterPtr->getSoftMacro()->getX();
++    float y = clusterPtr->getSoftMacro()->getY();
++    float width = clusterPtr->getSoftMacro()->getWidth();
++    float height = clusterPtr->getSoftMacro()->getHeight();
++    int x_pin = 0;
++    int y_pin = 0;
++    const int pin_offset = block_->micronsToDbu(0.07);
++
++    if(height==0){
++      if(y>1){  // 👆pin
++        x_pin = block_->micronsToDbu(x + width / 2);
++        y_pin = block_->micronsToDbu(y + height) - pin_offset;
++      }else{  // 👇pin
++        x_pin = block_->micronsToDbu(x + width / 2);
++        y_pin = block_->micronsToDbu(y) + pin_offset;        
++      }
++    }else if(width==0){
++      if(x>1){  // 👉pin
++        x_pin = block_->micronsToDbu(x + width) - pin_offset;
++        y_pin = block_->micronsToDbu(y + height / 2);
++      }else{  // 👈pin
++        x_pin = block_->micronsToDbu(x) + pin_offset;
++        y_pin = block_->micronsToDbu(y + height / 2);
++      }
++    }
++    if(pin_connect.second){  //true的话，这是INPUT PIN
++      line = "    - inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++                  " + NET inp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+" + DIRECTION INPUT + USE SIGNAL\n"
++             "      + PORT\n"
++             "        + LAYER metal6 ( -140 -140 ) ( 140 140 )\n"
++             "        + PLACED ( "+std::to_string(x_pin)+" "+std::to_string(y_pin)+" ) N ;";
++    }else{
++      line = "    - outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+
++                  " + NET outp"+std::to_string(pin_connect.first.first)+"_"+std::to_string(pin_connect.first.second)+" + DIRECTION OUTPUT + USE SIGNAL\n"
++             "      + PORT\n"
++             "        + LAYER metal6 ( -140 -140 ) ( 140 140 )\n"
++             "        + PLACED ( "+std::to_string(x_pin)+" "+std::to_string(y_pin)+" ) N ;";
++    }
++    write_def<<line<<std::endl;
++  }
++
++  write_def<<"END PINS"<<std::endl;
++  write_def<<"END DESIGN"<<std::endl;
++
++  write_def.close();
++
++}
++
++////////////////////////////////////////////////////////////////////////
++// Result Record
++////////////////////////////////////////////////////////////////////////
++void HierRTLMP::rebackRePlaceClusterLocation(){
++
++  // 这里stage_path_就能确保是bloat的还是shrink的
++  std::string path = stage_path_;
++  // 因为规模小，直接写读流程bp_root_placed.def
++  std::string def_name = "/"+block_->getName()+"_root_placed.def";
++  // std::string def_name = "/bp_root_placed.def";
++  std::string def_path = path+def_name;
++  std::ifstream def_file(def_path);
++  if (!def_file.is_open()) {
++    logger_->error(MPL, 1023, "Cannot open RePlace result DEF: {}", def_path);
++  }
++
++  // lambda表达式来拆分字符串,这个有错误?
++  auto splitString = [](const std::string& input) {
++    std::istringstream stream(input);
++    std::vector<std::string> tokens;
++    std::string token;
++    // 逐个提取
++    while (stream >> token) {
++      tokens.push_back(token); // 将每个非空格的单词添加到数组中
++    }
++    return tokens; // 返回包含所有单词的数组
++  };
++
++  // 为所有簇创建soft_macro
++  for (auto& cluster : tree_->root->getChildren()) {
++    if (cluster->isIOCluster()) {  // ignore all the io clusters
++      continue;
++    }
++    auto soft_macro = std::make_unique<SoftMacro>(cluster.get());
++    // no memory leakage, beacuse we set the soft macro, the old one
++    // will be deleted
++    cluster->setSoftMacro(std::move(soft_macro));
++  }
++
++  std::string line;
++  bool COMPONENT_flag = false;
++  while(std::getline(def_file,line)){
++    if(line.substr(0, 10) == "COMPONENTS"){
++      COMPONENT_flag = true;
++      continue;
++    }
++    if(line.substr(0, 14) == "END COMPONENTS"){
++      COMPONENT_flag = false;
++      break;
++    }
++    // std::string input = "    - U14 fake_macro2 + PLACED ( 20140 1436242 ) N ;";
++    // 使用 Lambda 表达式拆分字符串
++    if(COMPONENT_flag == true){
++      std::vector<std::string> tokens = splitString(line);
++      std::string num_str = tokens[1].substr(1);
++      int id = std::stoi(num_str);
++
++      auto current = tree_->maps.id_to_cluster.find(id);
++      if(current == tree_->maps.id_to_cluster.end()){
++        continue;
++      }
++      Cluster* cluster_ptr = current->second;
++      cluster_ptr->setX(block_->dbuToMicrons(std::stoi(tokens[6])));
++      cluster_ptr->setY(block_->dbuToMicrons(std::stoi(tokens[7])));
++      // cluster_ptr->getX();
++      // tree_->maps.id_to_cluster[id]->setX(std::stoi(tokens[7]));
++      // tree_->maps.id_to_cluster[id]->setY(std::stoi(tokens[8]));
++    }
++  }
++
++  def_file.close();
++
++  // id_shape_map_的回归bloat情况
++  if(diverge_flag_ == true){
++    for(auto& entry : id_shape_map_){
++      entry.second.first = entry.second.first * expand_ratio_;
++      entry.second.second = entry.second.second * expand_ratio_;
++    }
++  }
++
++  // 所有二级子簇视为在父簇的中心
++  // for(auto& cluster:tree_->root->getChildren()){
++  //   if(cluster->isIOCluster()){
++  //     continue;
++  //   }
++  //   PlaceSubCluster(cluster.get());
++  // }
++
++}
++
++void HierRTLMP::stdCellPlacement(){
++  // 修正顶层簇的坐标
++  for(auto& entry : id_shape_map_){
++    int id = entry.first;
++    float bloat_width = entry.second.first;
++    float bloat_height = entry.second.second;
++    float new_width = bloat_width/sqrt(expand_ratio_);
++    float new_height = bloat_height/sqrt(expand_ratio_);
++
++    auto current = tree_->maps.id_to_cluster.find(id);
++    Cluster* cluster_ptr = current->second;
++    // const SoftMacro* soft_macro = cluster_ptr->getSoftMacro();
++
++    float bloat_x = cluster_ptr->getX();
++    float bloat_y = cluster_ptr->getY();
++
++    float new_x = bloat_x + bloat_width/2 - new_width/2;
++    float new_y = bloat_y + bloat_height/2 - new_height/2;
++
++    cluster_ptr->setX(new_x);
++    cluster_ptr->setY(new_y);
++    cluster_ptr->getSoftMacro()->setWidth(new_width);
++    cluster_ptr->getSoftMacro()->setHeight(new_height);
++    entry.second.first = new_width;
++    entry.second.second = new_height;
++  }
++
++  // 生成次级簇的坐标
++  for(auto& cluster:tree_->root->getChildren()){
++    if(cluster->isIOCluster()){
++      continue;
++    }
++    PlaceSubCluster(cluster.get());
++  }
++
++  generateTemporaryStdCellsPlacement(tree_->root.get());
++
++}
++
++void HierRTLMP::generateTemporaryStdCellsPlacement(Cluster* cluster)
+ {
++  if (cluster->isLeaf() && cluster->getNumStdCell() != 0) {  // 
++    for (odb::dbModule* module : cluster->getDbModules()) {
++      setModuleStdCellsLocation(cluster, module);
++    }
++
++    for (odb::dbInst* leaf_std_cell : cluster->getLeafStdCells()) {
++      setTemporaryStdCellLocation(cluster, leaf_std_cell);
++    }
++  } else {
++    for (const auto& child : cluster->getChildren()) {
++      generateTemporaryStdCellsPlacement(child.get());
++    }
++  }
++}
++
++void HierRTLMP::PlaceSubCluster(Cluster* parent){
++  
++  int parent_id = parent->getId();
++  auto it = id_shape_map_.find(parent_id);
++  if(it == id_shape_map_.end()){
++    return;
++  }
++  std::pair<float,float> shape = it->second;
++
++  // 将所有二级子簇视为在父簇的中心，先得到这个二级子簇的面积，视为正方形
++  for(auto& cluster : parent->getChildren()){
++    // 为每个子簇创建soft_macro
++    auto soft_macro = std::make_unique<SoftMacro>(cluster.get());
++    cluster->setSoftMacro(std::move(soft_macro));
++    float sub_cluster_area = cluster->getMetrics().getStdCellArea();
++    if(cluster->getClusterType() != ClusterType::StdCellCluster){
++      for(auto& hardmacro : cluster->getHardMacros()){
++        sub_cluster_area += hardmacro->getWidth() * hardmacro->getHeight();
++      }
++    }
++
++    float sub_cluster_side = std::sqrt(sub_cluster_area);
++    cluster->setX(parent->getX() + shape.first/2 - sub_cluster_side/2);
++    cluster->setY(parent->getY() + shape.second/2 - sub_cluster_side/2);
++  }
++
+ }
+ 
++////////////////////////////////////////////////////////////////////////
++// Origin
++////////////////////////////////////////////////////////////////////////
++
+ ///////////////////////////////////////////////////////////////////////////
+ // Interfaces for setting up options
+ // Options related to macro placement
+@@ -223,73 +2378,6 @@ void HierRTLMP::setReportDirectory(const char* report_directory)
+   report_directory_ = report_directory;
+ }
+ 
+-// Top Level Function
+-// The flow of our MacroPlacer is divided into 6 stages.
+-// 1) Multilevel Autoclustering:
+-//      Transform logical hierarchy into physical hierarchy.
+-// 2) Coarse Shaping -> Bottom - Up:
+-//      Determine the rough shape function for each cluster.
+-// 3) Fine Shaping -> Top - Down:
+-//      Refine the possible shapes of each cluster based on the fixed
+-//      outline and location of its parent cluster.
+-//      *This is executed within hierarchical placement method.
+-// 4) Hierarchical Macro Placement -> Top - Down
+-//      a) Placement of Clusters (one level at a time);
+-//      b) Placement of Macros (one macro cluster at a time).
+-// 5) Boundary Pushing
+-//      Push macro clusters to the boundaries of the design if they don't
+-//      overlap with either bundled IOs' blockages or other macros.
+-// 6) Orientation Improvement
+-//      Attempts macro flipping to improve WR.
+-void HierRTLMP::run()
+-{
+-  runMultilevelAutoclustering();
+-  if (skip_macro_placement_) {
+-    logger_->info(MPL, 13, "Skipping macro placement.");
+-    return;
+-  }
+-
+-  if (!tree_->has_std_cells) {
+-    resetSAParameters();
+-  }
+-
+-  std::unique_ptr<Mpl2Observer> save_graphics;
+-  if (is_debug_only_final_result_) {
+-    save_graphics = std::move(graphics_);
+-  }
+-
+-  runCoarseShaping();
+-  runHierarchicalMacroPlacement();
+-
+-  if (save_graphics) {
+-    graphics_ = std::move(save_graphics);
+-    graphics_->setMaxLevel(tree_->max_level);
+-    graphics_->drawResult();
+-  }
+-
+-  Pusher pusher(logger_, tree_->root.get(), block_, boundary_to_io_blockage_);
+-  pusher.pushMacrosToCoreBoundaries();
+-
+-  updateMacrosOnDb();
+-
+-  generateTemporaryStdCellsPlacement(tree_->root.get());
+-  correctAllMacrosOrientation();
+-
+-  commitMacroPlacementToDb();
+-
+-  writeMacroPlacement(macro_placement_file_);
+-  clear();
+-}
+-
+-void HierRTLMP::init()
+-{
+-  block_ = db_->getChip()->getBlock();
+-}
+-
+-////////////////////////////////////////////////////////////////////////
+-// Private functions
+-////////////////////////////////////////////////////////////////////////
+-
+ // Transform the logical hierarchy into a physical hierarchy.
+ void HierRTLMP::runMultilevelAutoclustering()
+ {
+@@ -388,6 +2476,7 @@ void HierRTLMP::setRootShapes()
+   const float root_area = (root_ux - root_lx) * (root_uy - root_ly);
+   const float root_width = root_ux - root_lx;
+   const std::vector<std::pair<float, float>> root_width_list
++  
+       = {std::pair<float, float>(root_width, root_width)};
+ 
+   root_soft_macro->setShapes(root_width_list, root_area);
+@@ -2300,8 +4389,7 @@ void HierRTLMP::runHierarchicalMacroPlacementWithoutBusPlanning(Cluster* parent)
+           macros.emplace_back(
+               std::pair<float, float>(
+                   cluster->getX() + cluster->getWidth() / 2.0 - outline.xMin(),
+-                  cluster->getY() + cluster->getHeight() / 2.0
+-                      - outline.yMin()),
++                  cluster->getY() + cluster->getHeight() / 2.0 - outline.yMin()),
+               cluster->getName(),
+               0.0,
+               0.0,
+@@ -3942,22 +6030,21 @@ void HierRTLMP::setModuleStdCellsLocation(Cluster* cluster,
+ // Update the locations of std cells in odb using the locations that
+ // HierRTLMP estimates for the leaf standard clusters. This is needed
+ // for the orientation improvement step.
+-void HierRTLMP::generateTemporaryStdCellsPlacement(Cluster* cluster)
+-{
+-  if (cluster->isLeaf() && cluster->getNumStdCell() != 0) {
+-    for (odb::dbModule* module : cluster->getDbModules()) {
+-      setModuleStdCellsLocation(cluster, module);
+-    }
+-
+-    for (odb::dbInst* leaf_std_cell : cluster->getLeafStdCells()) {
+-      setTemporaryStdCellLocation(cluster, leaf_std_cell);
+-    }
+-  } else {
+-    for (const auto& child : cluster->getChildren()) {
+-      generateTemporaryStdCellsPlacement(child.get());
+-    }
+-  }
+-}
++// void HierRTLMP::generateTemporaryStdCellsPlacement(Cluster* cluster)
++// {
++//   if (cluster->isLeaf() && cluster->getNumStdCell() != 0) {  // 
++//     for (odb::dbModule* module : cluster->getDbModules()) {
++//       setModuleStdCellsLocation(cluster, module);
++//     }
++//     for (odb::dbInst* leaf_std_cell : cluster->getLeafStdCells()) {
++//       setTemporaryStdCellLocation(cluster, leaf_std_cell);
++//     }
++//   } else {
++//     for (const auto& child : cluster->getChildren()) {
++//       generateTemporaryStdCellsPlacement(child.get());
++//     }
++//   }
++// }
+ 
+ float HierRTLMP::calculateRealMacroWirelength(odb::dbInst* macro)
+ {
+diff --git a/src/mpl2/src/hier_rtlmp.h b/src/mpl2/src/hier_rtlmp.h
+index 8a09798e4..d60fd1fd2 100644
+--- a/src/mpl2/src/hier_rtlmp.h
++++ b/src/mpl2/src/hier_rtlmp.h
+@@ -40,6 +40,25 @@
+ 
+ #include "Mpl2Observer.h"
+ #include "clusterEngine.h"
++#include "odb/dbTransform.h"
++// 添加的库
++#include <tcl.h>
++#include <algorithm>
++#include <unistd.h>
++#include "absl/log/initialize.h"  // 日志初始化
++#include <cmath>
++// #include "ortools/linear_solver/linear_solver.h"
++
++// 线性规划的库
++#include <stdlib.h>
++#include "ortools/sat/model.h"
++#include "ortools/base/logging.h"
++#include "ortools/sat/cp_model.h"
++#include "ortools/sat/cp_model.pb.h"
++#include "ortools/sat/cp_model_solver.h"
++#include "ortools/util/sorted_interval_list.h"
++
++
+ 
+ namespace odb {
+ class dbBlock;
+@@ -86,6 +105,29 @@ struct LayerParameters
+ using LayersWithPinsMap = std::map<odb::dbTechLayer*, odb::dbITerm*>;
+ using LayerParametersMap = std::map<odb::dbTechLayer*, LayerParameters>;
+ 
++// 添加的结构体
++struct MacroDataflowNet{
++  MacroDataflowNet() : weight(0.0), driver_inst(nullptr), load_inst(nullptr) {}
++  // int id;
++  float weight;
++  odb::dbInst* driver_inst;
++  odb::dbInst* load_inst;
++  // std::set<odb::dbInst*> unorderd_items;
++  MacroDataflowNet(float weight, odb::dbInst* driver_inst,odb::dbInst* load_inst) : 
++    weight(weight), driver_inst(driver_inst), load_inst(load_inst) {}
++};
++
++  // KD树
++  struct KDNode {
++    int id;
++    float x;
++    float y;
++    KDNode* left;
++    KDNode* right;
++    KDNode(int id, float x, float y) : id(id), x(x), y(y), left(nullptr), right(nullptr) {}
++  };
++
++
+ // Hierarchical RTL-MP
+ // Support Multi-Level Clustering.
+ // Support designs with IO Pads.
+@@ -99,12 +141,14 @@ class HierRTLMP
+  public:
+   HierRTLMP(sta::dbNetwork* network,
+             odb::dbDatabase* db,
++            sta::dbSta* sta,
+             utl::Logger* logger,
+             par::PartitionMgr* tritonpart);
+   ~HierRTLMP();
+ 
+   void init();
+   void run();
++  bool runIncrementalMacroPlacement();
+ 
+   // Interfaces functions for setting options
+   // Hierarchical Macro Placement Related Options
+@@ -158,6 +202,131 @@ class HierRTLMP
+   using HardSAVector = std::vector<std::unique_ptr<SACoreHardMacro>>;
+   using IOSpans = std::map<Boundary, std::pair<float, float>>;
+ 
++////////////////////////////////////////////////////////////////////////
++// TDMP的函数
++////////////////////////////////////////////////////////////////////////
++  void GlobalMacroPlacement();
++
++  struct PairComparator {
++    bool operator()(const std::pair<int, int>& a, const std::pair<int, int>& b) const {
++        return std::tie(a.first, a.second) < std::tie(b.first, b.second);
++    }
++  };  
++
++  void runNewMacroPlacement();
++  void rebackRePlaceClusterLocation();
++  void removeHardMacroOverlap();
++
++  void shapeGenerate();
++  void WriteClusterResult();
++  void WriteDef();
++  void WriteDef(std::unordered_map<int,std::pair<float,float>> shrink_loc_map);
++  void WriteLef();
++  void WriteLib();
++  void WriteVerilog();
++
++  std::pair<float, float> setRandomShapes(Cluster& cluster);
++  void stdCellPlacement();
++
++  void InitializeMacroLocation();
++
++  std::vector<std::pair<std::pair<int,int>,bool>> ioid_clusterid_vector_;//IOid,clusterid,是否是IO
++  std::unordered_map<int,std::pair<float,float>> id_shape_map_;  //顶层簇的
++  float expand_ratio_ = 1.0;
++  std::string stage_path_;
++  bool diverge_flag_ = false;
++
++  // 运行顶层簇布局的函数
++  void runReplaceTcl();
++  void shrinkReplace();
++
++  // 线性规划的函数
++  void FirstLinearSolver(Cluster* cluster, std::vector<MacroDataflowNet> macro_dataflow_nets);
++  std::pair<int,int> SameMacroBestTiling(Cluster* cluster);
++
++  void SecondLinearSolver(Cluster* cluster,std::vector<std::vector<float>>& fence_region);
++  void SecondLinearSolver();
++
++  // 合法化
++  void macroLegalize(bool incre_flag);
++
++  // 伪网络约束
++  void clusterFakeNetStdGenerate();
++  // 二级簇的布局方法
++  void PlaceSubCluster(Cluster* parent);
++  std::vector<MacroDataflowNet> createMacroDataflowNet(Cluster* parent);
++  // void SimpleSatProgram();
++  // void insertKDtree();
++
++  // 定义一个哈希函数用于 std::pair<odb::dbInst*, odb::dbInst*>
++  struct pairHash2MacroNet {
++    template <class T1, class T2>
++    std::size_t operator()(const std::pair<T1, T2>& p) const {
++      auto hash1 = std::hash<T1>{}(p.first);
++      auto hash2 = std::hash<T2>{}(p.second);
++      return hash1 ^ hash2;
++    }
++  };
++
++
++
++////////////////////////////////////////////////////////////////////////
++// IncreMacro的函数
++////////////////////////////////////////////////////////////////////////
++bool IncrementalMacroPlacement(); 
++void IncreInitialize();
++// void CriticalMacroFilter();
++void MacroClassify();
++int TilingMacroExchange();
++int FreeMacroOptimize();
++// 新创建的函数
++void CriticalMacroFilter();
++struct DelaySample { 
++  float dx;
++  float dy;
++  float delay;
++  float weight;
++}; // 用于delay函数拟合
++
++std::map<odb::dbInst*,std::set<odb::dbInst*>> critical_macro_to_regs_;  // macro和连接的regs
++std::map<odb::dbInst*,float> critical_regs_slack_; // reg的slack表
++std::unordered_map<odb::dbInst*,std::vector<float>> macro_delay_fit; // 每个宏和寄存器拟合的delay参数
++std::vector<std::vector<HardMacro*>> tile_critical_macros_; // tile的关键宏，一个vector中是能交换的
++std::vector<HardMacro*> free_critical_macros_;  // free的关键宏
++
++// Incremental placement is launched from a placed DEF/ODB after standard-cell
++// placement, so it cannot depend on the global RTLMP HardMacro tree being
++// rebuilt. Keep dbInst-level groups for the ASP-DAC refinement stages.
++std::vector<std::vector<odb::dbInst*>> array_critical_macro_insts_;
++std::vector<odb::dbInst*> free_critical_macro_insts_;
++
++std::unordered_map<odb::dbInst*,std::vector<float>> critical_macro_slack_; // 统计关键宏的负slack的pin的slack
++
++// 改成下面这个数据结构
++std::unordered_map<odb::dbInst*, std::unordered_map<odb::dbITerm*, std::set<odb::dbInst*>>> macro_pin_regs_;
++// macro-pin-reg
++
++
++std::unordered_map<odb::dbInst*, bool> placed_macros_; // 不移动的已经locked的宏，在free中使用，避免重叠
++
++void initializeSTA();
++void analyzeMacroPins(const std::string& file_path,const std::string& output_file_path);
++void findDownstreamRegisters(odb::dbInst* macro,odb::dbITerm* iterm,std::set<odb::dbInst*>& found_regs,std::set<odb::dbITerm*>& visited);
++void findUpstreamRegisters(odb::dbInst* macro,odb::dbITerm* iterm,std::set<odb::dbInst*>& found_regs,std::set<odb::dbITerm*>& visited);
++void delayFitting(odb::dbInst* macro_inst); // 拟合函数，每个宏一个delay的二次函数
++std::pair<float,float> freeMacroLP(odb::dbInst* inst, int order);
++
++int MacroOrientOptimizer();
++void findBestOrient(odb::dbInst* macro,std::unordered_map<odb::dbITerm*,std::set<odb::dbInst*>> pin_regs);
++void findBestOrient(odb::dbInst* macro);
++
++int64_t ComputeMacroNetHpwl(odb::dbInst* macro);
++
++// 需要更详细的pin和reg的连接
++
++////////////////////////////////////////////////////////////////////////
++// Origin
++////////////////////////////////////////////////////////////////////////
+   void runMultilevelAutoclustering();
+   void runHierarchicalMacroPlacement();
+ 
+@@ -253,6 +422,7 @@ class HierRTLMP
+   odb::dbBlock* block_ = nullptr;
+   utl::Logger* logger_ = nullptr;
+   par::PartitionMgr* tritonpart_ = nullptr;
++  sta::dbSta* sta_ = nullptr;
+   std::unique_ptr<PhysicalHierarchy> tree_;
+ 
+   std::unique_ptr<ClusteringEngine> clustering_engine_;
+@@ -339,7 +509,7 @@ class HierRTLMP
+ 
+   // since we convert from the database unit to the micrometer
+   // during calculation, we may loss some accuracy.
+-  const float conversion_tolerance_ = 0.01;
++  const float conversion_tolerance_ = 0.1;
+ 
+   bool skip_macro_placement_ = false;
+ 
+diff --git a/src/mpl2/src/mpl.i b/src/mpl2/src/mpl.i
+index 72bfc683e..8a182d606 100644
+--- a/src/mpl2/src/mpl.i
++++ b/src/mpl2/src/mpl.i
+@@ -124,6 +124,12 @@ bool rtl_macro_placer_cmd(const int max_num_macro,
+                              report_directory);
+ }
+ 
++
++bool incremental_macro_placer_cmd()
++{
++  return getMacroPlacer2()->runIncrementalMacroPlacement();
++}
++
+ void set_debug_cmd(odb::dbBlock* block,
+                    bool coarse,
+                    bool fine,
+diff --git a/src/mpl2/src/mpl.tcl b/src/mpl2/src/mpl.tcl
+index c5d66e79f..586037787 100644
+--- a/src/mpl2/src/mpl.tcl
++++ b/src/mpl2/src/mpl.tcl
+@@ -256,6 +256,19 @@ proc rtl_macro_placer { args } {
+   return true
+ }
+ 
++
++sta::define_cmd_args "incremental_macro_placer" {}
++proc incremental_macro_placer { args } {
++  sta::parse_key_args "incremental_macro_placer" args keys {} flags {}
++  sta::check_argc_eq0 "incremental_macro_placer" $args
++
++  if { [ord::get_db_block] == "NULL" } {
++    utl::error MPL 1025 "No block found for Incremental Macro Placement."
++  }
++
++  return [mpl2::incremental_macro_placer_cmd]
++}
++
+ sta::define_cmd_args "place_macro" {-macro_name macro_name \
+                                     -location location \
+                                     [-orientation orientation] \
+diff --git a/src/mpl2/src/object.cpp b/src/mpl2/src/object.cpp
+index ed770109d..be85925fa 100644
+--- a/src/mpl2/src/object.cpp
++++ b/src/mpl2/src/object.cpp
+@@ -946,6 +946,17 @@ float HardMacro::getRealHeight() const
+   return height_ - 2 * halo_height_;
+ }
+ 
++// 添加的东西
++float HardMacro::getHaloWidth() const
++{
++  return halo_width_;
++}
++
++float HardMacro::getHaloHeight() const
++{
++  return halo_height_;
++}
++
+ // Orientation support
+ odb::dbOrientType HardMacro::getOrientation() const
+ {
+diff --git a/src/mpl2/src/object.h b/src/mpl2/src/object.h
+index aa86166b7..f1575aa9b 100644
+--- a/src/mpl2/src/object.h
++++ b/src/mpl2/src/object.h
+@@ -384,6 +384,11 @@ class HardMacro
+   float getRealWidth() const;
+   float getRealHeight() const;
+ 
++
++  // 加了点东西，反馈Holo的
++  float getHaloWidth() const;
++  float getHaloHeight() const;
++
+   // Orientation support
+   odb::dbOrientType getOrientation() const;
+   // We do not allow rotation of macros
+diff --git a/src/mpl2/src/rtl_mp.cpp b/src/mpl2/src/rtl_mp.cpp
+index 800e6ea9b..36cd3097a 100644
+--- a/src/mpl2/src/rtl_mp.cpp
++++ b/src/mpl2/src/rtl_mp.cpp
+@@ -54,7 +54,7 @@ void MacroPlacer2::init(sta::dbNetwork* network,
+                         utl::Logger* logger,
+                         par::PartitionMgr* tritonpart)
+ {
+-  hier_rtlmp_ = std::make_unique<HierRTLMP>(network, db, logger, tritonpart);
++  hier_rtlmp_ = std::make_unique<HierRTLMP>(network, db, sta, logger, tritonpart);
+   logger_ = logger;
+   db_ = db;
+ }
+@@ -128,6 +128,12 @@ bool MacroPlacer2::place(const int num_threads,
+   return true;
+ }
+ 
++bool MacroPlacer2::runIncrementalMacroPlacement()
++{
++  hier_rtlmp_->init();
++  return hier_rtlmp_->runIncrementalMacroPlacement();
++}
++
+ void MacroPlacer2::placeMacro(odb::dbInst* inst,
+                               const float& x_origin,
+                               const float& y_origin,
+diff --git a/src/mpl2/test/cpp/CMakeLists.txt b/src/mpl2/test/cpp/CMakeLists.txt
+index f5c3a3eb5..0dba826c7 100644
+--- a/src/mpl2/test/cpp/CMakeLists.txt
++++ b/src/mpl2/test/cpp/CMakeLists.txt
+@@ -18,6 +18,22 @@ add_executable(TestSnapper TestSnapper.cpp)
+ target_link_libraries(TestSnapper ${TEST_LIBS})
+ gtest_discover_tests(TestSnapper WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+ 
++
++add_executable(TestMacroPlacementSolver
++  TestMacroPlacementSolver.cpp
++  ../../src/MacroPlacementSolver.cpp
++)
++target_link_libraries(TestMacroPlacementSolver
++  GTest::gtest
++  GTest::gtest_main
++  ortools::ortools
++)
++target_include_directories(TestMacroPlacementSolver
++  PRIVATE
++    ../../src
++)
++gtest_discover_tests(TestMacroPlacementSolver WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
++
+ add_executable(mpl2_test mpl2_test.cc)
+ target_link_libraries(mpl2_test
+     GTest::gtest
+@@ -31,5 +47,6 @@ gtest_discover_tests(mpl2_test
+ add_dependencies(build_and_test
+     mpl2_test
+     TestSnapper
++    TestMacroPlacementSolver
+ )
+ 
+diff --git a/src/mpl2/test/cpp/TestMacroPlacementSolver.cpp b/src/mpl2/test/cpp/TestMacroPlacementSolver.cpp
+new file mode 100644
+index 000000000..fe31857fc
+--- /dev/null
++++ b/src/mpl2/test/cpp/TestMacroPlacementSolver.cpp
+@@ -0,0 +1,107 @@
++#include "../../src/MacroPlacementSolver.h"
++
++#include <unordered_map>
++
++#include "gtest/gtest.h"
++
++namespace mpl2 {
++
++TEST(MacroPlacementSolver, LegalizesOverlappingMacrosInCore)
++{
++  MacroPlacementSolver solver;
++  const SolverCore core{0, 0, 100, 100};
++  const std::vector<SolverRect> movable{{0, 0, 0, 40, 40}, {1, 10, 10, 50, 50}};
++
++  const auto result = solver.legalizeMacros(core, movable, {});
++
++  ASSERT_EQ(result.size(), 2);
++  std::unordered_map<int, SolverPlacement> by_id;
++  for (const SolverPlacement& placement : result) {
++    by_id[placement.id] = placement;
++  }
++  EXPECT_GE(by_id.at(0).x, 0);
++  EXPECT_GE(by_id.at(0).y, 0);
++  EXPECT_LE(by_id.at(0).x + 40, 100);
++  EXPECT_LE(by_id.at(0).y + 40, 100);
++  EXPECT_GE(by_id.at(1).x, 0);
++  EXPECT_GE(by_id.at(1).y, 0);
++  EXPECT_LE(by_id.at(1).x + 40, 100);
++  EXPECT_LE(by_id.at(1).y + 40, 100);
++
++  const bool separated_x = by_id.at(0).x + 40 <= by_id.at(1).x
++                           || by_id.at(1).x + 40 <= by_id.at(0).x;
++  const bool separated_y = by_id.at(0).y + 40 <= by_id.at(1).y
++                           || by_id.at(1).y + 40 <= by_id.at(0).y;
++  EXPECT_TRUE(separated_x || separated_y);
++}
++
++TEST(MacroPlacementSolver, ReportsInfeasibleLegalizationWithEmptyResult)
++{
++  MacroPlacementSolver solver;
++  const SolverCore core{0, 0, 50, 50};
++  const std::vector<SolverRect> movable{{0, 0, 0, 40, 40}, {1, 0, 0, 40, 40}};
++
++  const auto result = solver.legalizeMacros(core, movable, {});
++
++  EXPECT_TRUE(result.empty());
++}
++
++TEST(MacroPlacementSolver, PlacesClusterMacrosWithoutOverlap)
++{
++  MacroPlacementSolver solver;
++  const std::vector<SolverMacro> macros{{0, 30, 30}, {1, 30, 30}, {2, 20, 20}};
++  const std::vector<SolverWeightedNet> nets{{0, 1, 2}, {1, 2, 1}};
++
++  const auto result = solver.placeMacrosInCluster(100, 100, macros, nets, false);
++
++  ASSERT_EQ(result.size(), 3);
++  std::unordered_map<int, SolverPlacement> by_id;
++  for (const SolverPlacement& placement : result) {
++    by_id[placement.id] = placement;
++    EXPECT_GE(placement.x, 0);
++    EXPECT_GE(placement.y, 0);
++  }
++  for (size_t i = 0; i < macros.size(); ++i) {
++    for (size_t j = i + 1; j < macros.size(); ++j) {
++      const auto& a = macros[i];
++      const auto& b = macros[j];
++      const auto& pa = by_id.at(a.id);
++      const auto& pb = by_id.at(b.id);
++      const bool separated_x = pa.x + a.width <= pb.x || pb.x + b.width <= pa.x;
++      const bool separated_y = pa.y + a.height <= pb.y || pb.y + b.height <= pa.y;
++      EXPECT_TRUE(separated_x || separated_y);
++    }
++  }
++}
++
++
++TEST(MacroPlacementSolver, OptimizesConnectedMacrosByCenterDistance)
++{
++  MacroPlacementSolver solver;
++  const std::vector<SolverMacro> macros{{0, 80, 10}, {1, 10, 10}};
++  const std::vector<SolverWeightedNet> nets{{0, 1, 100}};
++
++  const auto result = solver.placeMacrosInCluster(100, 20, macros, nets, true);
++
++  ASSERT_EQ(result.size(), 2);
++  std::unordered_map<int, SolverPlacement> by_id;
++  for (const SolverPlacement& placement : result) {
++    by_id[placement.id] = placement;
++  }
++  const double wide_center_x = by_id.at(0).x + macros[0].width / 2.0;
++  const double small_center_x = by_id.at(1).x + macros[1].width / 2.0;
++  EXPECT_LE(std::abs(wide_center_x - small_center_x), 10.0);
++}
++
++TEST(MacroPlacementSolver, KeepsAllClusterMacrosWhenFineSolveIsInfeasible)
++{
++  MacroPlacementSolver solver;
++  const std::vector<SolverMacro> macros{{0, 80, 80}, {1, 80, 80}};
++  const std::vector<SolverWeightedNet> nets{{0, 1, 1}};
++
++  const auto result = solver.placeMacrosInCluster(100, 100, macros, nets, false);
++
++  EXPECT_EQ(result.size(), macros.size());
++}
++
++}  // namespace mpl2
